@@ -1,0 +1,51 @@
+# =============================================================================
+# config/settings.yaml — bundled default for local development
+#
+# In production, vault-agent renders the authoritative version of this file
+# from Vault KV (secret/data/mcp-agents/config) to /vault/secrets/settings.yaml
+# at pod startup. The bundled copy is only used when vault-agent is unavailable.
+# =============================================================================
+
+vault:
+  address: "http://127.0.0.1:8200"
+  namespace: ""
+  auth_method: "userpass"
+  gcp_secrets_mount: "gcp"
+  agent_approle_mount: "approle"
+
+gcp:
+  project_id: ""
+  region: "us-central1"
+
+llm:
+  provider: "anthropic"
+  model: "claude-sonnet-4-6"
+  temperature: 0
+
+agents:
+  data_agent:
+    description: "Handles GCS and BigQuery operations"
+    mcp_server: "data_server"
+    gcp_impersonated_account: "data-agent-gcp"
+  compute_agent:
+    description: "Handles GCE instance and infrastructure operations"
+    mcp_server: "compute_server"
+    gcp_impersonated_account: "compute-agent-gcp"
+
+# Local dev: stdio (subprocess). GKE: sse (separate pods via Consul mesh).
+mcp_servers:
+  data_server:
+    transport: stdio
+    command: python
+    args: ["-m", "vault_mcp_agents.mcp.data_server"]
+  compute_server:
+    transport: stdio
+    command: python
+    args: ["-m", "vault_mcp_agents.mcp.compute_server"]
+  # GKE example (Consul Connect upstreams on localhost):
+  # data_server:
+  #   transport: sse
+  #   url: "http://localhost:20000/sse"
+  # compute_server:
+  #   transport: sse
+  #   url: "http://localhost:20001/sse"

@@ -1,0 +1,652 @@
+# =============================================================================
+# Taskfile.yml — consul-mcp-agents Orchestration
+#
+# Phases:
+#   1: Network + HCP Vault + Vault PKI + Vault Config + Consul VMs
+#   2: GKE cluster + Consul dataplane Helm
+#   3: Vault K8s auth + MCP agent Docker image build + push + deploy
+#   4: Final full apply (reconcile)
+#
+# Prerequisites: task, terraform >= 1.9.0, packer >= 1.10.0, gcloud, kubectl,
+#                docker, vault, hcp, jq, uuidgen
+#
+# Quick start:
+#   cp tf/scenarios/consul-mcp-gke/terraform.tfvars.example tf/scenarios/consul-mcp-gke/terraform.tfvars
+#   # Edit terraform.tfvars with your values
+#   task all
+# =============================================================================
+
+version: "3"
+
+vars:
+  TF_DIR: "{{.TASKFILE_DIR}}/tf/scenarios/consul-mcp-gke"
+  PACKER_DIR: "packer"
+  DOCKER_DIR: "docker"
+  TOKEN_FILE: ".bootstrap-token"
+  GCP_PROJECT:
+    sh: val=$(grep -E '^gcp_project_id' {{.TF_DIR}}/terraform.tfvars 2>/dev/null | awk -F'"' '{print $2}'); echo "${val:-UNSET}"
+  GCP_REGION:
+    sh: val=$(grep -E '^gcp_region' {{.TF_DIR}}/terraform.tfvars 2>/dev/null | awk -F'"' '{print $2}'); echo "${val:-us-central1}"
+  AR_REPO:
+    sh: val=$(grep -E '^artifact_registry_repo' {{.TF_DIR}}/terraform.tfvars 2>/dev/null | awk -F'"' '{print $2}'); echo "${val:-vault-mcp}"
+  IMAGE_REPO: "{{.GCP_REGION}}-docker.pkg.dev/{{.GCP_PROJECT}}/{{.AR_REPO}}/vault-mcp-agents"
+  MCP_IMAGE_TAG:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo "latest"
+
+env:
+  TF_VAR_consul_bootstrap_token:
+    sh: cat {{.TOKEN_FILE}} 2>/dev/null || echo ""
+
+# =============================================================================
+# TASKS
+# =============================================================================
+
+tasks:
+
+  default:
+    desc: "List all available tasks"
+    cmds:
+      - task --list
+
+  # ---------------------------------------------------------------------------
+  # Tfvars helpers (used by multiple tasks)
+  # ---------------------------------------------------------------------------
+
+  ingress:sync-ip:
+    desc: "Detect public IP and update allowed_ingress_cidrs in terraform.tfvars if changed"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - |
+        CURRENT_IP=$(curl -s --max-time 5 ifconfig.me)
+        if [ -z "$CURRENT_IP" ]; then
+          echo "ERROR: Could not determine public IP (ifconfig.me unreachable)"
+          exit 1
+        fi
+        EXISTING=$(grep -E '^allowed_ingress_cidrs' terraform.tfvars 2>/dev/null \
+          | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        if [ "$CURRENT_IP" = "$EXISTING" ]; then
+          echo "Public IP unchanged: ${CURRENT_IP}/32"
+        else
+          [ -n "$EXISTING" ] && echo "Public IP changed: ${EXISTING} -> ${CURRENT_IP}"
+          [ -z "$EXISTING" ] && echo "Setting public IP: ${CURRENT_IP}"
+          sed -i.bak '/^allowed_ingress_cidrs/d' terraform.tfvars
+          echo "allowed_ingress_cidrs = [\"${CURRENT_IP}/32\"]" >> terraform.tfvars
+          rm -f terraform.tfvars.bak
+          echo "Updated allowed_ingress_cidrs = [\"${CURRENT_IP}/32\"]"
+        fi
+
+  tfvars:set:
+    desc: "Set a key=value in terraform.tfvars (idempotent). Set QUOTED=true to wrap value in double quotes."
+    internal: true
+    dir: "{{.TF_DIR}}"
+    vars:
+      QUOTED: "false"
+    cmds:
+      - |
+        QUOTED_FLAG=""
+        [ "{{.QUOTED}}" = "true" ] && QUOTED_FLAG="--quoted"
+        {{.TASKFILE_DIR}}/scripts/tfvars-set.sh terraform.tfvars set "{{.KEY}}" "{{.VALUE}}" $QUOTED_FLAG
+
+  # ---------------------------------------------------------------------------
+  # Top-level orchestration
+  # ---------------------------------------------------------------------------
+
+  all:
+    desc: "Full deployment — network -> HCP Vault -> PKI -> Consul -> GKE -> MCP agents"
+    cmds:
+      - task: preflight
+      - task: ingress:sync-ip
+      - task: token:ensure
+      - task: tf:backend:init
+      - task: packer:build
+      - task: phase1:apply
+      - task: phase2:apply
+      - task: phase3:apply
+      - task: phase4:apply
+      - task: summary
+
+  destroy:
+    desc: "Destroy all Terraform resources then delete Packer GCE images"
+    prompt: "This will destroy ALL resources (Terraform + Packer GCE images) including the HCP Vault cluster. Continue?"
+    cmds:
+      - task: tf:destroy
+      - task: packer:destroy
+
+
+  summary:
+    desc: "Print deployment summary"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform output deployment_summary
+
+  # ---------------------------------------------------------------------------
+  # GCP authentication
+  # ---------------------------------------------------------------------------
+
+  gcloud:login:
+    desc: "Authenticate gcloud CLI, set application-default credentials, and configure Docker for Artifact Registry"
+    cmds:
+      - gcloud auth login
+      - gcloud auth application-default login
+      - gcloud auth configure-docker {{.GCP_REGION}}-docker.pkg.dev
+
+  # ---------------------------------------------------------------------------
+  # Preflight
+  # ---------------------------------------------------------------------------
+
+  preflight:
+    desc: "Check all required tools are installed and GCP auth is configured"
+    cmds:
+      - ./scripts/preflight.sh "{{.GCP_PROJECT}}" "{{.GCP_REGION}}"
+
+  # ---------------------------------------------------------------------------
+  # Bootstrap token
+  # ---------------------------------------------------------------------------
+
+  token:ensure:
+    desc: "Create Consul bootstrap token if it doesn't exist"
+    cmds:
+      - |
+        if [ -f "{{.TOKEN_FILE}}" ] && [ -s "{{.TOKEN_FILE}}" ]; then
+          echo "Bootstrap token exists: $(cat {{.TOKEN_FILE}})"
+        else
+          uuidgen | tr '[:upper:]' '[:lower:]' > {{.TOKEN_FILE}}
+          echo "Bootstrap token created: $(cat {{.TOKEN_FILE}})"
+          echo "IMPORTANT: Back up this token securely!"
+        fi
+
+  token:rotate:
+    desc: "Generate a new bootstrap token (requires full rebuild)"
+    prompt: "Rotating the token requires rebuilding the Packer image and re-applying Terraform. Continue?"
+    cmds:
+      - uuidgen | tr '[:upper:]' '[:lower:]' > {{.TOKEN_FILE}}
+      - echo "New token generated. Run 'task packer:build && task all' to apply."
+
+  # ---------------------------------------------------------------------------
+  # Terraform backend
+  # ---------------------------------------------------------------------------
+
+  tf:backend:init:
+    desc: "Create GCS state bucket if absent, enable versioning, init Terraform backend"
+    vars:
+      BUCKET: "{{.GCP_PROJECT}}-consul-mcp-tfstate"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - |
+        if [ "{{.GCP_PROJECT}}" = "UNSET" ]; then
+          echo "ERROR: gcp_project_id not set in terraform.tfvars"
+          exit 1
+        fi
+        if gsutil ls "gs://{{.BUCKET}}" &>/dev/null; then
+          echo "State bucket gs://{{.BUCKET}} already exists."
+        else
+          echo "Creating state bucket gs://{{.BUCKET}}..."
+          gsutil mb -p {{.GCP_PROJECT}} -l {{.GCP_REGION}} -b on "gs://{{.BUCKET}}"
+          gsutil versioning set on "gs://{{.BUCKET}}"
+        fi
+      - terraform init -upgrade -migrate-state -backend-config="bucket={{.BUCKET}}"
+
+  # ---------------------------------------------------------------------------
+  # Packer
+  # ---------------------------------------------------------------------------
+
+  packer:build:
+    desc: "Build the Consul server GCP image with vault-agent"
+    dir: "{{.PACKER_DIR}}"
+    cmds:
+      - task: packer:validate
+      - |
+        packer build \
+          -var "gcp_project_id={{.GCP_PROJECT}}" \
+          -var "gcp_region={{.GCP_REGION}}" \
+          -var "gcp_zone={{.GCP_REGION}}-a" \
+          gcp-almalinux-consul-server.pkr.hcl
+
+  packer:validate:
+    desc: "Validate Packer templates"
+    dir: "{{.PACKER_DIR}}"
+    cmds:
+      - packer init gcp-almalinux-consul-server.pkr.hcl
+      - packer validate -var "gcp_project_id={{.GCP_PROJECT}}" gcp-almalinux-consul-server.pkr.hcl
+
+  packer:destroy:
+    desc: "Delete all GCP images in the consul-server image family"
+    vars:
+      IMAGE_FAMILY: "almalinux-consul-server-vault"
+    cmds:
+      - |
+        IMAGES=$(gcloud compute images list \
+          --project {{.GCP_PROJECT}} \
+          --filter="family={{.IMAGE_FAMILY}}" \
+          --format="value(name)")
+        if [ -z "$IMAGES" ]; then
+          echo "No images found in family '{{.IMAGE_FAMILY}}'."
+          exit 0
+        fi
+        echo "$IMAGES"
+        echo "$IMAGES" | xargs gcloud compute images delete --project {{.GCP_PROJECT}} --quiet
+        echo "Packer images deleted."
+
+  # ---------------------------------------------------------------------------
+  # Terraform: phased apply
+  # ---------------------------------------------------------------------------
+
+  tf:init:
+    run: once
+    desc: "Initialise Terraform providers and backend (bucket must already exist; use tf:backend:init for first run)"
+    vars:
+      BUCKET: "{{.GCP_PROJECT}}-consul-mcp-tfstate"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform init -upgrade -backend-config="bucket={{.BUCKET}}"
+
+  phase1:apply:
+    desc: "Phase 1: Network + HCP Vault + PKI + Vault Config + Consul VMs"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - task: tf:init
+      - |
+        echo "=== Phase 1a: Infrastructure foundation ==="
+        terraform apply -parallelism=20 \
+          -target=module.network \
+          -target=module.hcp_vault \
+          -target=google_artifact_registry_repository.mcp \
+          -target=google_service_account.consul_server \
+          -target=google_service_account.vault_gcp_verifier \
+          -target=google_service_account_key.vault_gcp_verifier \
+          -target=google_project_iam_member.vault_gcp_verifier_key_admin \
+          -target=google_service_account_iam_member.consul_server_self \
+          -target=google_project_iam_member.consul_server_metadata \
+          -auto-approve
+      - |
+        echo "=== Phase 1b: Vault PKI and config ==="
+        terraform apply -parallelism=20 \
+          -target=module.vault_pki \
+          -target=module.vault_config \
+          -auto-approve
+      - |
+        echo "=== Phase 1c: Consul VMs ==="
+        terraform apply -parallelism=10 -target=module.consul -auto-approve
+      - echo "Phase 1 complete. Wait 2-3 minutes for Consul to boot."
+
+  phase2:apply:
+    desc: "Phase 2: GKE cluster + Consul Helm"
+    dir: "{{.TF_DIR}}"
+    deps: [tf:init]
+    cmds:
+      - |
+        CLUSTER_NAME=$(grep -E '^gke_cluster_name' terraform.tfvars | awk -F'"' '{print $2}')
+        EXISTING_ENDPOINT=$(gcloud container clusters describe "${CLUSTER_NAME}" \
+          --region {{.GCP_REGION}} --project {{.GCP_PROJECT}} \
+          --format="value(endpoint)" 2>/dev/null || echo "")
+        if [ -z "$EXISTING_ENDPOINT" ]; then
+          echo "=== Phase 2a: Creating GKE cluster ==="
+          terraform apply -parallelism=10 -target=module.gke -auto-approve
+        else
+          echo "GKE cluster already exists (${EXISTING_ENDPOINT}), skipping 2a."
+        fi
+      - task: gke:ensure-ready
+        vars: { REQUIRED: "true" }
+      - |
+        # Create consul namespace and K8s secrets via Terraform so they're in
+        # state before consul:refresh-tls / consul:bootstrap-acl run.  The
+        # scripts' kubectl-apply calls become idempotent updates, not creates.
+        echo "=== Pre-creating consul namespace + K8s secrets (Terraform) ==="
+        terraform apply -parallelism=10 \
+          -target='module.gke.kubernetes_namespace.consul[0]' \
+          -target='module.gke.kubernetes_secret.consul_ca_cert[0]' \
+          -target='module.gke.kubernetes_secret.consul_bootstrap_token[0]' \
+          -auto-approve
+      - task: consul:refresh-tls
+      - task: consul:bootstrap-acl
+      - |
+        echo "=== Phase 2b: Consul Helm + K8s resources ==="
+        terraform apply -parallelism=10 -target=module.gke -auto-approve
+      - |
+        echo "=== Waiting for consul-server-acl-init ==="
+        # Hook delete policy may remove the job after success — if gone assume complete
+        if ! kubectl get job consul-server-acl-init -n consul &>/dev/null 2>&1; then
+          echo "  Job not found (likely cleaned up after success). Verifying auth method..."
+        elif kubectl wait --for=condition=Complete job/consul-server-acl-init -n consul --timeout=360s 2>/dev/null; then
+          echo "  consul-server-acl-init completed successfully."
+        else
+          # Check if it failed (kubectl wait exits non-zero on timeout OR if condition not met)
+          FAILED=$(kubectl get job consul-server-acl-init -n consul \
+            -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || echo "")
+          if [ "$FAILED" = "True" ]; then
+            echo "  ERROR: consul-server-acl-init FAILED. Logs:"
+            kubectl logs -n consul -l job-name=consul-server-acl-init --tail=100 2>/dev/null || true
+            echo ""
+            echo "  Diagnose with: task consul:helm-clean then re-run: task phase2:apply"
+            exit 1
+          fi
+          # Job not found (cleaned up) or timed out — check if auth method exists downstream
+          echo "  kubectl wait timed out or job removed. Verifying auth method..."
+        fi
+      - task: consul:verify-auth-method
+      - echo "Phase 2 complete."
+
+  phase3:apply:
+    desc: "Phase 3: Vault K8s auth, Docker build+push, MCP agent deployments, print URL"
+    dir: "{{.TF_DIR}}"
+    deps: [tf:init]
+    cmds:
+      - task: gke:ensure-ready
+        vars: { REQUIRED: "true" }
+      - task: vault:configure-k8s-auth
+      - task: docker:build
+      - task: docker:push
+      - task: phase3:fix-k8s-identity
+      - |
+        echo "=== Phase 3: MCP agent deployments ==="
+        terraform apply -parallelism=10 \
+          -target=kubernetes_service_account.vault_reviewer \
+          -target=kubernetes_cluster_role_binding.vault_reviewer \
+          -target=kubernetes_secret.vault_reviewer_token \
+          -target=module.mcp_agents \
+          -auto-approve
+      - task: mcp:url
+
+  phase3:fix-k8s-identity:
+    desc: "Remove phase-3 K8s resources from state if they have the provider identity bug"
+    internal: true
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - |
+        "{{.TASKFILE_DIR}}/scripts/tf-fix-k8s-identity.sh" '^module\.mcp_agents\[0\]\.consul_'
+
+  phase4:apply:
+    desc: "Phase 4: Final full apply — reconcile all resources"
+    dir: "{{.TF_DIR}}"
+    deps: [tf:init]
+    cmds:
+      - terraform apply -parallelism=20 -auto-approve
+
+  tf:plan:
+    desc: "Plan all changes"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform plan
+
+  tf:apply:
+    desc: "Apply all changes (with Docker rebuild)"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - task: preflight
+      - task: gke:ensure-ready
+        vars: { REQUIRED: "false" }
+      - task: docker:build
+      - task: docker:push
+      - terraform apply -parallelism=20 -auto-approve
+      - task: mcp:url
+
+  tf:destroy:
+    desc: "Destroy all resources"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - task: preflight
+      - task: tfvars:set
+        vars: { KEY: "gke_cluster_ready", VALUE: "false" }
+      - task: tf:fix-k8s-identity
+      - terraform destroy -auto-approve
+
+  tf:output:
+    desc: "Show all Terraform outputs"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform output
+
+  tf:fix-k8s-identity:
+    desc: "Workaround for Kubernetes provider 'Unexpected Identity Change' bug"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - |
+        "{{.TASKFILE_DIR}}/scripts/tf-fix-k8s-identity.sh" --cleanup
+
+  # ---------------------------------------------------------------------------
+  # Vault
+  # ---------------------------------------------------------------------------
+
+  vault:configure-k8s-auth:
+    desc: "Configure Vault Kubernetes auth backend via Terraform"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - |
+        echo "=== Configuring Vault K8s auth ==="
+        terraform apply -parallelism=10 \
+          -target=module.vault_config \
+          -target=kubernetes_service_account.vault_reviewer \
+          -target=kubernetes_cluster_role_binding.vault_reviewer \
+          -target=kubernetes_secret.vault_reviewer_token \
+          -auto-approve
+
+  vault:status:
+    desc: "Check Vault cluster status"
+    vars:
+      VAULT_URL:
+        sh: cd "{{.TF_DIR}}" && terraform output -raw vault_public_url 2>/dev/null || echo "http://127.0.0.1:8200"
+    cmds:
+      - vault status -address="{{.VAULT_URL}}"
+
+  vault:login:operator:
+    desc: "Log in to Vault as operator (alice)"
+    env:
+      VAULT_ADDR:
+        sh: cd "{{.TF_DIR}}" && terraform output -raw vault_public_url 2>/dev/null || echo "http://127.0.0.1:8200"
+    cmds:
+      - vault login -method=userpass username=alice
+
+  # ---------------------------------------------------------------------------
+  # GKE
+  # ---------------------------------------------------------------------------
+
+  gke:ensure-ready:
+    desc: "Get kubeconfig, set gke_cluster_ready=true, update private endpoint in tfvars"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - |
+        CLUSTER=$(grep -E '^gke_cluster_name' terraform.tfvars 2>/dev/null | awk -F'"' '{print $2}')
+        [ -z "$CLUSTER" ] && { [ "{{.REQUIRED}}" = "true" ] && echo "ERROR: No gke_cluster_name in tfvars" && exit 1 || exit 0; }
+
+        STATUS=$(gcloud container clusters describe "${CLUSTER}" \
+          --region {{.GCP_REGION}} --project {{.GCP_PROJECT}} \
+          --format="value(status)" 2>/dev/null || echo "NOT_FOUND")
+        if [ "${STATUS}" != "RUNNING" ]; then
+          [ "{{.REQUIRED}}" = "true" ] && echo "ERROR: Cluster '${CLUSTER}' status is '${STATUS}' (expected RUNNING)." && exit 1
+          exit 0
+        fi
+
+        # Update kubeconfig
+        gcloud container clusters get-credentials "${CLUSTER}" \
+          --region {{.GCP_REGION}} --project {{.GCP_PROJECT}} --quiet
+        if ! kubectl cluster-info --request-timeout=10s &>/dev/null; then
+          [ "{{.REQUIRED}}" = "true" ] && echo "ERROR: K8s API not reachable." && exit 1
+          exit 0
+        fi
+
+        # Update private endpoint in tfvars (Consul VMs need this for TokenReview)
+        PRIVATE_ENDPOINT=$(gcloud container clusters describe "${CLUSTER}" \
+          --region {{.GCP_REGION}} --project {{.GCP_PROJECT}} \
+          --format="value(privateClusterConfig.privateEndpoint)" 2>/dev/null || echo "")
+        [ -z "$PRIVATE_ENDPOINT" ] && echo "WARNING: empty private endpoint — TokenReview from Consul VMs may fail"
+
+        # Update tfvars: clean stale keys, set private endpoint + phase gate
+        TVSET="{{.TASKFILE_DIR}}/scripts/tfvars-set.sh"
+        $TVSET terraform.tfvars remove gke_cluster_endpoint gke_cluster_ca_certificate gke_cluster_private_endpoint gke_cluster_ready
+        [ -n "$PRIVATE_ENDPOINT" ] && $TVSET terraform.tfvars set gke_cluster_private_endpoint "${PRIVATE_ENDPOINT}" --quoted
+        $TVSET terraform.tfvars set gke_cluster_ready true
+        echo "GKE ready — kubeconfig set, gke_cluster_ready=true, private endpoint: ${PRIVATE_ENDPOINT:-<empty>}"
+    vars:
+      REQUIRED: "false"
+
+  gke:nodes:
+    desc: "List GKE nodes"
+    cmds:
+      - kubectl get nodes -o wide
+
+  # ---------------------------------------------------------------------------
+  # Docker
+  # ---------------------------------------------------------------------------
+
+  docker:build:
+    desc: "Build the vault-mcp-agents Docker image"
+    cmds:
+      - |
+        docker build \
+          --platform linux/amd64 \
+          --cache-from "{{.IMAGE_REPO}}:latest" \
+          --tag "{{.IMAGE_REPO}}:{{.MCP_IMAGE_TAG}}" \
+          --tag "{{.IMAGE_REPO}}:latest" \
+          --file docker/Dockerfile \
+          --build-arg VAULT_VERSION=1.21.3 \
+          --build-arg TTYD_VERSION=1.7.7 \
+          .
+
+  docker:push:
+    desc: "Push the MCP agent image to Artifact Registry"
+    cmds:
+      - gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://{{.GCP_REGION}}-docker.pkg.dev
+      - docker push "{{.IMAGE_REPO}}:{{.MCP_IMAGE_TAG}}"
+      - docker push "{{.IMAGE_REPO}}:latest"
+
+  # ---------------------------------------------------------------------------
+  # MCP agents
+  # ---------------------------------------------------------------------------
+
+  mcp:status:
+    desc: "Show MCP agent pod and service status"
+    cmds:
+      - kubectl get pods -n mcp-agents -o wide
+      - echo ""
+      - kubectl get svc -n mcp-agents
+
+  mcp:url:
+    desc: "Get the MCP agent web terminal URL"
+    cmds:
+      - |
+        IP=$(kubectl get svc mcp-agent -n mcp-agents \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+        if [ -n "$IP" ]; then
+          echo "Web terminal: http://${IP}/"
+          echo "Users: alice (operator), bob (analyst), carol (viewer)"
+        else
+          echo "LoadBalancer IP not yet assigned. Run: kubectl get svc mcp-agent -n mcp-agents -w"
+        fi
+
+  mcp:logs:
+    desc: "Tail MCP agent pod logs"
+    cmds:
+      - kubectl logs -n mcp-agents -l app.kubernetes.io/name=mcp-agents -f --all-containers=true
+
+  mcp:exec:
+    desc: "Open a shell in an MCP agent pod"
+    cmds:
+      - kubectl exec -it -n mcp-agents deployment/mcp-agents -c mcp-app -- bash
+
+  mcp:restart:
+    desc: "Rolling restart of MCP agent pods"
+    cmds:
+      - kubectl rollout restart deployment/mcp-agent -n mcp-agents
+      - kubectl rollout status deployment/mcp-agent -n mcp-agents
+
+  # ---------------------------------------------------------------------------
+  # Consul
+  # ---------------------------------------------------------------------------
+
+  consul:tunnel:
+    desc: "Start IAP tunnel to Consul server (8501 -> localhost:18501)"
+    cmds:
+      - |
+        lsof -ti:18501 | xargs kill -9 2>/dev/null || true
+        VM_NAME=$(gcloud compute instances list \
+          --filter="name~consul-server" \
+          --format="value(name)" --project={{.GCP_PROJECT}} 2>/dev/null | head -1)
+        [ -z "$VM_NAME" ] && echo "ERROR: No Consul server VM found" && exit 1
+        echo "Starting IAP tunnel: ${VM_NAME}:8501 -> localhost:18501"
+        gcloud compute start-iap-tunnel "${VM_NAME}" 8501 \
+          --local-host-port=localhost:18501 \
+          --zone={{.GCP_REGION}}-a --project={{.GCP_PROJECT}} &
+        TUNNEL_PID=$!
+        echo "$TUNNEL_PID" > /tmp/consul-iap-tunnel.pid
+        for i in $(seq 1 30); do
+          if lsof -i :18501 -P >/dev/null 2>&1; then
+            echo "Tunnel running (PID $TUNNEL_PID). Use 'consul:tunnel-stop' to stop."
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "ERROR: Port 18501 not bound after 30s. Check IAP firewall rule."
+        exit 1
+
+  consul:tunnel-stop:
+    desc: "Stop the Consul IAP tunnel"
+    cmds:
+      - |
+        if [ -f /tmp/consul-iap-tunnel.pid ]; then
+          kill $(cat /tmp/consul-iap-tunnel.pid) 2>/dev/null || true
+          rm -f /tmp/consul-iap-tunnel.pid
+          echo "Tunnel stopped."
+        else
+          echo "No tunnel PID file found."
+        fi
+
+  consul:status:
+    desc: "Check Consul cluster health"
+    cmds:
+      - |
+        TOKEN=$(vault kv get -field=token secret/consul/acl-token 2>/dev/null || cat {{.TOKEN_FILE}} 2>/dev/null || echo "")
+        [ -z "$TOKEN" ] && echo "ERROR: No Consul token found in Vault or {{.TOKEN_FILE}}" && exit 1
+        ./scripts/consul-ssh.sh "{{.TF_DIR}}" "{{.GCP_PROJECT}}" "{{.GCP_REGION}}" \
+          "CONSUL_HTTP_TOKEN=${TOKEN} consul members"
+
+  consul:bootstrap-acl:
+    desc: "Bootstrap Consul ACLs — updates tfvars and K8s secret (idempotent)"
+    cmds:
+      - ./scripts/consul-bootstrap-acl.sh "{{.TF_DIR}}" "{{.GCP_PROJECT}}" "{{.GCP_REGION}}" "{{.TOKEN_FILE}}"
+
+  consul:verify-auth-method:
+    desc: "Verify consul-k8s-component-auth-method exists on the Consul server"
+    cmds:
+      - |
+        echo "=== Verifying consul-k8s-component-auth-method ==="
+        TOKEN=$(./scripts/tfvars-get.sh "{{.TF_DIR}}/terraform.tfvars" consul_bootstrap_token)
+        [ -z "$TOKEN" ] && echo "FAIL: No consul_bootstrap_token in terraform.tfvars" && exit 1
+
+        RESULT=$(./scripts/consul-ssh.sh "{{.TF_DIR}}" "{{.GCP_PROJECT}}" "{{.GCP_REGION}}" \
+          "consul acl auth-method list -token='${TOKEN}' 2>&1" || true)
+
+        if echo "$RESULT" | grep -q "consul-k8s-component-auth-method"; then
+          echo "  OK: consul-k8s-component-auth-method exists."
+        else
+          echo "  FAIL: consul-k8s-component-auth-method not found on Consul server."
+          echo "  Auth methods present:"
+          echo "$RESULT"
+          echo ""
+          echo "  The consul-server-acl-init Job did not complete successfully."
+          echo "  Run: task consul:helm-clean then re-run: task phase2:apply"
+          exit 1
+        fi
+
+  consul:helm-clean:
+    desc: "Uninstall the Consul Helm release and delete namespace — clean slate for retry"
+    cmds:
+      - |
+        echo "=== Cleaning Consul Helm release ==="
+        helm uninstall consul -n consul --wait --timeout=5m 2>/dev/null || true
+        kubectl delete namespace consul --ignore-not-found --wait=true
+        echo "Consul Helm release removed. Re-run: task phase2:apply"
+
+  consul:refresh-tls:
+    desc: "Re-issue Consul server TLS cert and sync consul-ca-cert K8s secret"
+    cmds:
+      - |
+        echo "=== Refreshing Consul server TLS cert ==="
+        SSH="./scripts/consul-ssh.sh {{.TF_DIR}} {{.GCP_PROJECT}} {{.GCP_REGION}}"
+        echo "  Calling cert-refresh script..."
+        $SSH "sudo /usr/local/bin/vault-agent-cert-refresh.sh"
+        echo "  Fetching new CA chain..."
+        CA_CHAIN=$($SSH "sudo cat /etc/consul.d/tls/ca-chain.pem")
+        [ -z "$CA_CHAIN" ] && echo "ERROR: Could not read CA chain from VM." && exit 1
+        ./scripts/sync-k8s-secret.sh consul consul-ca-cert tls.crt "${CA_CHAIN}" || true
+        echo "  TLS cert refresh complete."
+

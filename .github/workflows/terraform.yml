@@ -1,0 +1,116 @@
+# =============================================================================
+# GitHub Actions — Terraform Validation Pipeline
+#
+# Runs on PRs and pushes to main that touch tf/ files.
+# No cloud credentials required — uses -backend=false for validation.
+#
+# Jobs:
+#   fmt      — terraform fmt -check -recursive
+#   validate — terraform init -backend=false && terraform validate
+#   tfsec    — static security analysis (catches OWASP/CIS findings)
+#   tflint   — provider-aware linting (invalid types, deprecated args)
+#
+# Applies remain manual via Taskfile (task tf:plan / task tf:apply).
+# =============================================================================
+
+name: Terraform Validate
+
+on:
+  pull_request:
+    paths:
+      - "tf/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tf/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+  pull-requests: write  # tfsec PR comments
+
+env:
+  TF_DIR: tf/scenarios/consul-mcp-gke
+  TERRAFORM_VERSION: "1.9.8"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Format check — fast, catches style drift
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive tf/
+
+  # ---------------------------------------------------------------------------
+  # Validate — syntax and internal consistency (no cloud credentials needed)
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: terraform init (no backend)
+        run: terraform -chdir=${{ env.TF_DIR }} init -backend=false
+
+      - name: terraform validate
+        run: terraform -chdir=${{ env.TF_DIR }} validate
+
+  # ---------------------------------------------------------------------------
+  # tfsec — static security analysis
+  #
+  # Catches: public LBs, overly broad IAM, missing encryption, deletion
+  # protection disabled, 0.0.0.0/0 in firewall rules, etc.
+  # Maps to CIS GCP Foundation Benchmark controls.
+  # ---------------------------------------------------------------------------
+  tfsec:
+    name: Security Scan (tfsec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: tf/
+          soft_fail: true  # don't block PRs initially; tighten after baseline is clean
+
+  # ---------------------------------------------------------------------------
+  # tflint — provider-aware linting
+  #
+  # Catches: invalid machine types, deprecated resource arguments, naming
+  # violations, unused declarations. Requires plugin for google provider.
+  # ---------------------------------------------------------------------------
+  tflint:
+    name: Lint (tflint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init tflint plugins
+        run: tflint --init --config .tflint.hcl
+
+      - name: Lint all modules
+        run: |
+          for dir in $(find tf/ -name '*.tf' -exec dirname {} \; | sort -u | grep -v '.terraform'); do
+            echo "=== Linting $dir ==="
+            tflint --config "$(pwd)/.tflint.hcl" --chdir "$dir" || true
+          done

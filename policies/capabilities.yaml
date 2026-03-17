@@ -1,0 +1,61 @@
+# =============================================================================
+# policies/capabilities.yaml — bundled default for local development
+#
+# In production, vault-agent renders the authoritative version from
+# Vault KV (secret/data/mcp-agents/policies) to /vault/secrets/capabilities.yaml.
+# The bundled copy is only used when vault-agent is unavailable.
+# =============================================================================
+
+roles:
+  operator:
+    vault_policy: "operator-policy"
+    agents:
+      data_agent:
+        allowed_tools:
+          - list_buckets
+          - read_object
+          - write_object
+          - delete_object
+          - query_bigquery
+          - list_datasets
+          - create_dataset
+        max_gcp_token_ttl: "5m"
+      compute_agent:
+        allowed_tools:
+          - list_instances
+          - get_instance
+          - start_instance
+          - stop_instance
+          - create_instance
+          - delete_instance
+        max_gcp_token_ttl: "5m"
+
+  analyst:
+    vault_policy: "analyst-policy"
+    agents:
+      data_agent:
+        allowed_tools:
+          - list_buckets
+          - read_object
+          - query_bigquery
+          - list_datasets
+        max_gcp_token_ttl: "5m"
+      compute_agent:
+        allowed_tools:
+          - list_instances
+          - get_instance
+        max_gcp_token_ttl: "5m"
+
+  viewer:
+    vault_policy: "viewer-policy"
+    agents:
+      data_agent:
+        allowed_tools:
+          - list_buckets
+          - read_object
+          - list_datasets
+        max_gcp_token_ttl: "5m"
+      compute_agent:
+        allowed_tools:
+          - list_instances
+        max_gcp_token_ttl: "5m"

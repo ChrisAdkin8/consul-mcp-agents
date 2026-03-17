@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vault-mcp-agents"
+version = "0.1.0"
+description = "Vault-secured MCP AI agents for GCS, BigQuery, and GCE"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0,<1.0",
+    "openai>=1.0.0,<3.0",
+    "mcp>=1.6.0,<2.0",
+    "hvac>=2.1.0,<3.0",
+    "google-cloud-storage>=2.0.0,<3.0",
+    "google-cloud-bigquery>=3.0.0,<4.0",
+    "google-cloud-compute>=1.14.0,<2.0",
+    "google-auth>=2.0.0,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "click>=8.0,<9.0",
+    "rich>=13.0,<14.0",
+    "starlette>=0.27.0,<1.0",
+    "uvicorn>=0.24.0,<1.0",
+    "httpx-sse>=0.4.0,<1.0",
+    "sqlglot>=25.0.0,<27.0",
+]
+
+[project.scripts]
+vault-mcp-agents = "vault_mcp_agents.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]

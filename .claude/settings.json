@@ -1,0 +1,66 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(terraform init:*)",
+      "Bash(terraform plan:*)",
+      "Bash(terraform fmt:*)",
+      "Bash(terraform validate:*)",
+      "Bash(terraform state:*)",
+      "Bash(terraform output:*)",
+      "Bash(terraform taint:*)",
+      "Bash(terraform console:*)",
+      "Bash(task:*)",
+      "Bash(kubectl get:*)",
+      "Bash(kubectl describe:*)",
+      "Bash(kubectl logs:*)",
+      "Bash(helm get:*)",
+      "Bash(helm list:*)",
+      "Bash(gcloud container:*)",
+      "Bash(gcloud compute:*)",
+      "Bash(gcloud iam:*)",
+      "Bash(gcloud artifacts:*)",
+      "Bash(python3:*)",
+      "Bash(d2:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(cd:*)",
+      "WebSearch"
+    ],
+    "ask": [
+      "Bash(terraform apply:*)",
+      "Bash(terraform destroy:*)",
+      "Bash(helm uninstall:*)",
+      "Bash(kubectl delete:*)",
+      "Bash(rm:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$TOOL_INPUT\" | grep -q '\"file_path\".*tf/.*\\.tf'; then cd /Users/chris.adkin/Projects/consul-mcp-agents && terraform fmt -recursive tf/ 2>/dev/null && echo 'terraform fmt: ok' || true; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$TOOL_INPUT\" | grep -q '\"file_path\".*tf/.*\\.tf'; then MODULE_DIR=$(echo \"$TOOL_INPUT\" | grep -o '\"file_path\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' | sed 's/.*\"\\(.*\\)\"/\\1/' | xargs dirname); cd \"$MODULE_DIR\" 2>/dev/null && terraform validate 2>&1 | tail -5 || true; fi"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "terraform": {
+      "command": "npx",
+      "args": ["-y", "terraform-mcp-server"],
+      "env": {}
+    }
+  }
+}

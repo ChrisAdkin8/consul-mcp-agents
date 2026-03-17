@@ -1,0 +1,117 @@
+# =============================================================================
+# vault-agent-consul.hcl.tmpl
+#
+# Template for vault-agent configuration on Consul server VMs.
+# Placeholders (__ prefixed/suffixed) are replaced by the first-boot renderer
+# script (render-vault-agent-config.sh) using values from GCP instance metadata.
+#
+# vault-agent renders three output files:
+#   1. /etc/consul.d/connect-ca.hcl   — Vault PKI Connect CA config for Consul
+#   2. /etc/consul.d/tls-certs.hcl    — TLS cert paths (issued by Vault PKI)
+#   3. /tmp/vault-agent-ready          — Sentinel file (Consul waits for this)
+#
+# After rendering, vault-agent continues running as a daemon to:
+#   • Keep the Vault token renewed (auto_auth periodic token)
+#   • Re-render configs if certs are rotated (TTL-based re-render)
+# =============================================================================
+
+# ---- Vault server connection ----
+vault {
+  address   = "__VAULT_ADDR__"
+  namespace = "admin"  # HCP Vault uses the admin namespace for all user resources
+
+  # Retry aggressively on startup in case network is not ready
+  retry {
+    num_retries = 10
+  }
+}
+
+# ---- Auto-auth: GCP IAM method ----
+# The VM signs a JWT using its GCP service account (IAM API call).
+# Vault verifies the JWT against Google's public certs — no GCP credentials
+# needed on the Vault side, making this compatible with HCP Vault.
+auto_auth {
+  method "gcp" {
+    mount_path = "auth/gcp"
+
+    config = {
+      type            = "iam"
+      role            = "__GCP_ROLE__"
+      service_account = "__SA_EMAIL__"  # Explicit SA prevents "default" auto-detect issue
+    }
+  }
+
+  # Write the Vault token to a file so Consul can use it for the CA provider
+  sink "file" {
+    config = {
+      path = "/opt/vault/vault-token"
+      mode = 0640
+    }
+  }
+}
+
+# ---- Template 1: Connect CA config ----
+# Configures Consul to use Vault PKI as the Connect Certificate Authority.
+# Consul calls Vault's PKI sign endpoint to issue leaf certs for service proxies.
+template {
+  destination = "/etc/consul.d/connect-ca.hcl"
+  perms       = "0640"
+
+  contents = <<-EOT
+    # Rendered by vault-agent — do not edit manually
+    connect {
+      enabled     = true
+      ca_provider = "vault"
+
+      ca_config {
+        address               = "__VAULT_ADDR__"
+        token                 = "{{ file "/opt/vault/vault-token" }}"
+        namespace             = "admin"
+        root_pki_path         = "__ROOT_PKI_PATH__"
+        intermediate_pki_path = "__INTER_PKI_PATH__"
+        leaf_cert_ttl         = "72h"
+        rotation_period       = "2160h"
+        intermediate_cert_ttl = "8760h"
+        private_key_type      = "rsa"
+        private_key_bits      = 2048
+      }
+    }
+  EOT
+
+  command = "chgrp consul /etc/consul.d/connect-ca.hcl && chmod 0640 /etc/consul.d/connect-ca.hcl || true"
+}
+
+# ---- Template 2: Server TLS certificates ----
+# Issues a TLS certificate for the Consul server's RPC and HTTPS endpoints.
+# vault-agent re-renders this before expiry (TTL: 72h, re-rendered at 66h).
+template {
+  destination = "/etc/consul.d/tls-certs.hcl"
+  perms       = "0640"
+
+  contents = <<-EOT
+    # Rendered by vault-agent — do not edit manually
+    {{ with pkiCert "__INTER_PKI_PATH__/issue/consul-server-tls" "common_name=server.__DATACENTER__.consul" "alt_names=localhost" "ip_sans=127.0.0.1" "ttl=72h" }}
+    tls {
+      defaults {
+        cert_file = "/etc/consul.d/tls/server.crt"
+        key_file  = "/etc/consul.d/tls/server.key"
+        ca_file   = "/etc/consul.d/tls/ca-chain.pem"
+      }
+    }
+    {{ .Cert | writeToFile "/etc/consul.d/tls/server.crt" "" "vault" "0640" }}
+    {{ .Key  | writeToFile "/etc/consul.d/tls/server.key" "" "vault" "0640" }}
+    {{ .CA   | writeToFile "/etc/consul.d/tls/ca-chain.pem" "" "vault" "0640" }}
+    {{ end }}
+  EOT
+
+  command = "chgrp consul /etc/consul.d/tls-certs.hcl /etc/consul.d/tls/server.crt /etc/consul.d/tls/server.key /etc/consul.d/tls/ca-chain.pem 2>/dev/null || true"
+}
+
+# ---- Template 3: Ready sentinel ----
+# Written after all other templates complete. The startup script waits for
+# this file before starting Consul.
+template {
+  destination = "/tmp/vault-agent-ready"
+  perms       = "0644"
+  contents    = "ready"
+}

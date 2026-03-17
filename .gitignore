@@ -1,0 +1,57 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Bootstrap token — NEVER commit this
+.bootstrap-token
+
+# Packer
+packer_cache/
+packer/configs/consul-server.hcl
+packer/configs/consul-client.hcl
+
+# Docker
+docker/*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Secrets
+*.hclic
+*.pem
+*.key
+*.crt
+*.p12
+*credentials*.json
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Editor
+.idea/
+.vscode/
+*.code-workspace
+
+# Claude Code — local settings (personal permissions, not shared)
+.claude/settings.local.json
+
+# Diagrams (generated — commit the PNGs not the intermediate files)
+docs/diagrams/*.svg
