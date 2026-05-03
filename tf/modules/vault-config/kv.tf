@@ -23,6 +23,10 @@ resource "vault_mount" "secret" {
   type        = "kv"
   options     = { version = "2" }
   description = "KV v2 store for MCP agent application configuration and secrets"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -44,11 +48,10 @@ resource "vault_kv_secret_v2" "mcp_config" {
   data_json = jsonencode({
     settings_yaml = yamlencode({
       vault = {
-        address             = var.vault_private_endpoint_url
-        namespace           = "admin"
-        auth_method         = "kubernetes"
-        gcp_secrets_mount   = var.gcp_secrets_mount_path
-        agent_approle_mount = "approle"
+        address           = var.vault_private_endpoint_url
+        namespace         = "admin"
+        auth_method       = "kubernetes"
+        gcp_secrets_mount = var.gcp_secrets_mount_path
       }
       gcp = {
         project_id = var.gcp_project_id

@@ -85,7 +85,7 @@ module "vault_config" {
   openai_api_key             = var.openai_api_key
   consul_bootstrap_token     = var.consul_bootstrap_token
   gke_cluster_name           = var.gke_cluster_name
-  mcp_namespace              = "mcp-agents"
+  mcp_namespace              = local.mcp_namespace
   vault_users                = var.vault_users
 
   # GKE details — populated from data source once gke_cluster_ready = true

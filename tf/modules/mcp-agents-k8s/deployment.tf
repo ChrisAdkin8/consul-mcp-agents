@@ -171,8 +171,13 @@ resource "kubernetes_deployment" "mcp_agent" {
             value = "/tmp/vault-agent-ready"
           }
           env {
-            name  = "TTYD_CREDENTIAL"
-            value = var.ttyd_credential
+            name = "TTYD_CREDENTIAL"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.ttyd_credential.metadata[0].name
+                key  = "credential"
+              }
+            }
           }
 
           port {
@@ -206,7 +211,7 @@ resource "kubernetes_deployment" "mcp_agent" {
             run_as_user                = 1000
             run_as_non_root            = true
             allow_privilege_escalation = false
-            read_only_root_filesystem  = false
+            read_only_root_filesystem  = true
             capabilities {
               drop = ["ALL"]
             }
@@ -429,6 +434,10 @@ resource "kubernetes_deployment" "mcp_server" {
             mount_path = "/vault/secrets"
             read_only  = true
           }
+          volume_mount {
+            name       = "tmp"
+            mount_path = "/tmp"
+          }
 
           resources {
             requests = {
@@ -445,7 +454,7 @@ resource "kubernetes_deployment" "mcp_server" {
             run_as_user                = 1000
             run_as_non_root            = true
             allow_privilege_escalation = false
-            read_only_root_filesystem  = false
+            read_only_root_filesystem  = true
             capabilities {
               drop = ["ALL"]
             }
@@ -559,6 +568,11 @@ resource "kubernetes_deployment" "mcp_server" {
           empty_dir {
             medium = "Memory"
           }
+        }
+
+        volume {
+          name = "tmp"
+          empty_dir {}
         }
       }
     }

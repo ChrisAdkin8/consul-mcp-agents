@@ -26,6 +26,8 @@ tflint --config .tflint.hcl --chdir tf/scenarios/consul-mcp-gke  # local lint
 - Always run `terraform fmt -recursive` before committing
 - GKE uses native `google_container_cluster` / `google_container_node_pool` — do not migrate to community module
 - CI runs `fmt -check`, `validate`, `tfsec`, and `tflint` on every PR touching `tf/` — fix locally before pushing
+- **Stateful resources have `prevent_destroy = true`**: Vault PKI root + intermediate mounts (`vault-pki-consul`), Vault KV mount (`vault-config`), and the GCP secrets backend. Destroying any of these would invalidate every Connect mTLS cert in the mesh or wipe MCP agent config. To intentionally destroy, comment out the lifecycle block, apply, then restore.
+- **Provider versions are pinned to minor**: `~> 5.44` (google), `~> 4.4` (vault), `~> 2.36` (kubernetes), `~> 2.17` (helm), `~> 2.21` (consul). Bumps require regenerating `.terraform.lock.hcl` (`terraform init -upgrade`) and re-running CI.
 
 ## Conventions
 
@@ -101,8 +103,13 @@ kubectl rollout restart deployment -n consul
 - Compute: `ALLOWED_MACHINE_TYPES` whitelist (e2/n2 types)
 - All tool handlers validate required args before GCP calls
 - Error sanitization: only `type(exc).__name__` returned to LLM, details logged server-side
-- `allowed_ingress_cidrs` has no default, rejects `0.0.0.0/0`
+- `allowed_ingress_cidrs` has no default, rejects `0.0.0.0/0`. Same validation applies to `gke_authorized_cidrs` (operator + HCP CIDRs only — never the open internet).
 - IAM: least-privilege SAs (`storage.objectAdmin` not `storage.admin`, `compute.instanceAdmin.v1` not `compute.admin`)
+- **Vault impersonator SA has no project-level IAM grants** — `serviceAccountTokenCreator` is bound only to the specific data/compute agent SAs via `google_service_account_iam_member`. Adding a project-level role on this SA would broaden blast radius to every SA in the project.
+- **K8s pods run with `read_only_root_filesystem = true`** — agent and server containers each mount a tmpfs `emptyDir` at `/tmp` for the readiness probe sentinel and any process-local writes. Any new container that needs to write outside `/tmp` requires its own writable `volume_mount`; do not flip ROFS off.
+- **Sensitive env vars come from Secrets, not plain `value`** — e.g. `TTYD_CREDENTIAL` is sourced via `secret_key_ref` from `kubernetes_secret.ttyd_credential` so it never appears in `kubectl describe pod` or audit logs. Apply the same pattern to any new credential env var.
+- **Consul ingress gateway LB is restricted** — Helm values include `loadBalancerSourceRanges` derived from `allowed_ingress_cidrs`. Matches the mcp-agent LB pattern; do not expose the gateway openly.
+- **GKE uses STABLE release channel + 45m create timeout** — control plane and node pools auto-upgrade. Optional `gke_database_encryption_key` (Cloud KMS resource name) enables Application-layer Secrets Encryption (CIS 8.5.5) when set; empty default falls back to Google-managed encryption at rest.
 - Docker: Chainguard Wolfi-based images (`cgr.dev/chainguard/wolfi-base`, `cgr.dev/chainguard/python:latest-dev`) — zero/near-zero CVEs vs. dozens in `python:3.11-slim`. Runtime `python-3.14` apk version must match builder `latest-dev` Python version.
 - Docker binary verification: Vault uses GPG-signed `SHA256SUMS` from HashiCorp (key `C874011F0AB405110D02105534365D9472D7468F`); ttyd uses upstream `SHA256SUMS` from GitHub release. No hardcoded checksums — version bumps only require changing the `ARG` version.
 
@@ -115,11 +122,11 @@ kubectl rollout restart deployment -n consul
 | `fmt` | `terraform fmt -check -recursive` | Catch formatting drift |
 | `validate` | `terraform init -backend=false && validate` | Syntax + internal consistency |
 | `tfsec` | `aquasecurity/tfsec-action` | Static security analysis (CIS, OWASP) |
-    | `tflint` | `tflint` + google plugin | Provider-aware linting (invalid types, deprecated args) |
+| `tflint` | `tflint` + google plugin | Provider-aware linting (invalid types, deprecated args) |
 
 - **No cloud credentials needed** — validation uses `-backend=false`
 - **Applies remain manual** via Taskfile (`task tf:plan` / `task tf:apply`) — the phase-gated workflow is too complex for automated apply
-- **tfsec runs with `soft_fail: true`** initially — tighten to hard fail after baseline findings are resolved
+- **tfsec hard-fails** the pipeline on any finding (`soft_fail: false`). tflint also hard-fails — the per-module loop tracks an `exit_code` and exits non-zero if any module fails.
 - **tflint config**: `.tflint.hcl` at repo root, uses the `google` provider ruleset
 - To run the same checks locally before pushing: `terraform fmt -check -recursive tf/ && tflint --init --config .tflint.hcl && tflint --config .tflint.hcl --chdir tf/scenarios/consul-mcp-gke`
 

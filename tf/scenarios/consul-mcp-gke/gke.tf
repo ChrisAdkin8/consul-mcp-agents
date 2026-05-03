@@ -25,10 +25,15 @@ module "gke" {
   consul_bootstrap_token  = var.consul_bootstrap_token
   vault_ca_chain_pem      = module.vault_pki.ca_chain_pem
   helm_chart_version      = var.helm_chart_version
-  mcp_namespace           = "mcp-agents"
+  mcp_namespace           = local.mcp_namespace
   gke_endpoint            = local.cluster_endpoint
   gke_private_endpoint    = var.gke_cluster_private_endpoint
   authorized_networks     = var.gke_authorized_cidrs
+
+  # Cluster lifecycle and security
+  deletion_protection           = var.gke_deletion_protection
+  database_encryption_key       = var.gke_database_encryption_key
+  ingress_gateway_source_ranges = var.allowed_ingress_cidrs
 
   # Workload Identity bindings — service_account_id requires full resource name
   data_agent_sa_name    = module.vault_config.data_agent_sa_name

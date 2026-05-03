@@ -83,14 +83,40 @@ resource "google_container_cluster" "main" {
     }
   }
 
-  # Enable Kubernetes RBAC
-  enable_legacy_abac = false
+  # Auto-upgrade control plane and nodes via release channel
+  release_channel {
+    channel = var.release_channel
+  }
 
-  # Logging and monitoring
-  logging_service    = "logging.googleapis.com/kubernetes"
-  monitoring_service = "monitoring.googleapis.com/kubernetes"
+  # Logging and monitoring (block form supersedes deprecated string args)
+  logging_config {
+    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
 
-  deletion_protection = false
+  monitoring_config {
+    enable_components = ["SYSTEM_COMPONENTS"]
+    managed_prometheus {
+      enabled = true
+    }
+  }
+
+  # Application-layer Secrets Encryption (CIS 8.5.5).
+  # Enabled when var.database_encryption_key is set; otherwise default Google encryption applies.
+  dynamic "database_encryption" {
+    for_each = var.database_encryption_key != "" ? [1] : []
+    content {
+      state    = "ENCRYPTED"
+      key_name = var.database_encryption_key
+    }
+  }
+
+  deletion_protection = var.deletion_protection
+
+  timeouts {
+    create = "45m"
+    update = "45m"
+    delete = "30m"
+  }
 
   lifecycle {
     ignore_changes = [
@@ -98,7 +124,7 @@ resource "google_container_cluster" "main" {
       node_version,
       # Ignore initial_node_count (managed by node pool)
       initial_node_count,
-      # Version managed by STABLE release channel
+      # Version managed by release channel
       min_master_version,
     ]
   }
@@ -155,6 +181,12 @@ resource "google_container_node_pool" "main" {
   upgrade_settings {
     max_surge       = 1
     max_unavailable = 0
+  }
+
+  timeouts {
+    create = "30m"
+    update = "30m"
+    delete = "30m"
   }
 }
 

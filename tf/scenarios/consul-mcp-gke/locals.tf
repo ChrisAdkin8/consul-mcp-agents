@@ -31,4 +31,7 @@ locals {
 
   # Image repository base path in Artifact Registry
   image_repo_base = "${var.gcp_region}-docker.pkg.dev/${var.gcp_project_id}/${var.artifact_registry_repo}"
+
+  # Kubernetes namespace for MCP agent workloads — referenced by gke and vault-config modules
+  mcp_namespace = "mcp-agents"
 }

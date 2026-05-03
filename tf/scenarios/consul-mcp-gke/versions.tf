@@ -20,7 +20,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 5.0"
+      version = "~> 5.44"
     }
     hcp = {
       source  = "hashicorp/hcp"
@@ -28,27 +28,27 @@ terraform {
     }
     vault = {
       source  = "hashicorp/vault"
-      version = "~> 4.0"
+      version = "~> 4.4"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = "~> 2.0"
+      version = "~> 2.36"
     }
     helm = {
       source  = "hashicorp/helm"
-      version = "~> 2.0"
+      version = "~> 2.17"
     }
     consul = {
       source  = "hashicorp/consul"
-      version = "~> 2.0"
+      version = "~> 2.21"
     }
     random = {
       source  = "hashicorp/random"
-      version = "~> 3.0"
+      version = "~> 3.6"
     }
     local = {
       source  = "hashicorp/local"
-      version = "~> 2.0"
+      version = "~> 2.5"
     }
   }
 

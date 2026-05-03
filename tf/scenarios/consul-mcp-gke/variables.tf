@@ -258,12 +258,40 @@ variable "gke_master_cidr" {
 }
 
 variable "gke_authorized_cidrs" {
-  description = "Additional CIDRs allowed to reach the GKE API server (e.g. operator workstation IPs)."
+  description = "Additional CIDRs allowed to reach the GKE API server (e.g. operator workstation IPs). 0.0.0.0/0 is rejected."
   type = list(object({
     cidr = string
     name = string
   }))
   default = []
+
+  validation {
+    condition     = !contains([for c in var.gke_authorized_cidrs : c.cidr], "0.0.0.0/0")
+    error_message = "gke_authorized_cidrs must not contain 0.0.0.0/0. Specify explicit operator and HCP Vault CIDRs."
+  }
+}
+
+variable "gke_deletion_protection" {
+  description = "Block terraform destroy on the GKE cluster. Set to false only for dev environments."
+  type        = bool
+  default     = true
+}
+
+variable "gke_database_encryption_key" {
+  description = "Cloud KMS key resource name for GKE Application-layer Secrets Encryption (CIS 8.5.5). Empty string disables (default Google encryption applies)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.gke_database_encryption_key == "" || can(regex("^projects/.+/locations/.+/keyRings/.+/cryptoKeys/.+$", var.gke_database_encryption_key))
+    error_message = "gke_database_encryption_key must be empty or a full KMS key resource name (projects/.../cryptoKeys/...)."
+  }
+}
+
+variable "consul_config_force_destroy" {
+  description = "Allow Terraform to delete the Consul config GCS bucket even when it contains objects. Set to false for staging/prod."
+  type        = bool
+  default     = true
 }
 
 variable "helm_chart_version" {

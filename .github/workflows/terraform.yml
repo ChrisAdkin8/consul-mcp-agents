@@ -87,7 +87,7 @@ jobs:
         uses: aquasecurity/tfsec-action@v1.0.3
         with:
           working_directory: tf/
-          soft_fail: true  # don't block PRs initially; tighten after baseline is clean
+          soft_fail: false
 
   # ---------------------------------------------------------------------------
   # tflint — provider-aware linting
@@ -110,7 +110,9 @@ jobs:
 
       - name: Lint all modules
         run: |
+          exit_code=0
           for dir in $(find tf/ -name '*.tf' -exec dirname {} \; | sort -u | grep -v '.terraform'); do
             echo "=== Linting $dir ==="
-            tflint --config "$(pwd)/.tflint.hcl" --chdir "$dir" || true
+            tflint --config "$(pwd)/.tflint.hcl" --chdir "$dir" || exit_code=1
           done
+          exit "$exit_code"

@@ -69,7 +69,9 @@ resource "kubernetes_service" "mcp_server" {
   }
 }
 
-# PodDisruptionBudget — ensure at least 1 agent pod is always available
+# PodDisruptionBudget — cap voluntary disruptions to one pod at a time.
+# Using max_unavailable rather than min_available so single-replica deployments
+# don't block node drains during cluster upgrades.
 resource "kubernetes_pod_disruption_budget_v1" "mcp_agent" {
   metadata {
     name      = "mcp-agent-pdb"
@@ -77,7 +79,7 @@ resource "kubernetes_pod_disruption_budget_v1" "mcp_agent" {
   }
 
   spec {
-    min_available = 1
+    max_unavailable = 1
 
     selector {
       match_labels = {
@@ -96,7 +98,7 @@ resource "kubernetes_pod_disruption_budget_v1" "mcp_server" {
   }
 
   spec {
-    min_available = 1
+    max_unavailable = 1
 
     selector {
       match_labels = {

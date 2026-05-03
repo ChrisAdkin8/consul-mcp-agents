@@ -41,23 +41,11 @@ resource "google_service_account_key" "vault_impersonator" {
   #   task vault:rotate-gcp-sa-key
 }
 
-# Grant the impersonator SA the minimum IAM permissions for token generation.
-# serviceAccountKeyAdmin: manage SA keys (needed for Vault GCP backend credentials)
-# serviceAccountTokenCreator: call generateAccessToken on agent SAs
-locals {
-  vault_sa_roles = [
-    "roles/iam.serviceAccountKeyAdmin",
-    "roles/iam.serviceAccountTokenCreator",
-  ]
-}
-
-resource "google_project_iam_member" "vault_impersonator" {
-  for_each = toset(local.vault_sa_roles)
-
-  project = var.gcp_project_id
-  role    = each.value
-  member  = "serviceAccount:${google_service_account.vault_impersonator.email}"
-}
+# IAM grants for the Vault impersonator SA are scoped to specific target SAs at
+# the resource level (see google_service_account_iam_member.vault_impersonates_*
+# below). Project-level grants of serviceAccountTokenCreator/KeyAdmin are not
+# needed in impersonation mode and would broaden blast radius to every SA in
+# the project.
 
 # ---------------------------------------------------------------------------
 # Vault GCP secrets engine
@@ -71,7 +59,14 @@ resource "vault_gcp_secret_backend" "main" {
   default_lease_ttl_seconds = 300 # 5 minutes — cannot exceed max
   max_lease_ttl_seconds     = 300 # Hard ceiling; Vault refuses TTL > this
 
-  depends_on = [google_project_iam_member.vault_impersonator]
+  depends_on = [
+    google_service_account_iam_member.vault_impersonates_data,
+    google_service_account_iam_member.vault_impersonates_compute,
+  ]
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # ---------------------------------------------------------------------------

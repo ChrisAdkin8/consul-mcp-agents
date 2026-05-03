@@ -15,7 +15,7 @@ resource "google_storage_bucket" "consul_config" {
   project                     = var.gcp_project_id
   location                    = var.gcp_region
   uniform_bucket_level_access = true
-  force_destroy               = true
+  force_destroy               = var.consul_config_force_destroy
 
   labels = local.common_labels
 }

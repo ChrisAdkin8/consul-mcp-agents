@@ -30,6 +30,11 @@ resource "vault_mount" "connect_root" {
   description               = "Root Certificate Authority for Consul Connect service mesh"
   default_lease_ttl_seconds = 3153600   # 36.5 days
   max_lease_ttl_seconds     = 315360000 # 10 years
+
+  # Destroying the root CA invalidates every Consul mTLS cert in the mesh.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Self-signed Root CA certificate — private key stays in Vault (type=internal)
@@ -68,6 +73,10 @@ resource "vault_mount" "connect_intermediate" {
   description               = "Intermediate CA for Consul Connect — issues leaf mTLS certs"
   max_lease_ttl_seconds     = 3153600 # 36.5 days max for intermediate CA / leaf certs
   default_lease_ttl_seconds = 259200  # 72 hours default for leaf certs
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Generate intermediate CSR (private key stays in Vault)

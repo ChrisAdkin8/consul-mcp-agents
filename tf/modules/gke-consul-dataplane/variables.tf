@@ -233,3 +233,32 @@ variable "compute_agent_sa_name" {
     error_message = "compute_agent_sa_name must not be empty."
   }
 }
+
+variable "deletion_protection" {
+  description = "Block terraform destroy on the GKE cluster. Set to false only for dev."
+  type        = bool
+  default     = true
+}
+
+variable "release_channel" {
+  description = "GKE release channel for control plane and node auto-upgrades."
+  type        = string
+  default     = "STABLE"
+
+  validation {
+    condition     = contains(["RAPID", "REGULAR", "STABLE", "UNSPECIFIED"], var.release_channel)
+    error_message = "release_channel must be one of: RAPID, REGULAR, STABLE, UNSPECIFIED."
+  }
+}
+
+variable "database_encryption_key" {
+  description = "Cloud KMS key resource name for Application-layer Secrets Encryption. Empty string disables."
+  type        = string
+  default     = ""
+}
+
+variable "ingress_gateway_source_ranges" {
+  description = "CIDR ranges allowed to reach the Consul ingress gateway LoadBalancer. Must be set when enable_ingress_gateway=true."
+  type        = list(string)
+  default     = []
+}

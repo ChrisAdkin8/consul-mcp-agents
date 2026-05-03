@@ -259,6 +259,16 @@ resource "helm_release" "consul" {
     value = "443"
   }
 
+  # Restrict ingress gateway LB to allowed CIDRs (matches mcp-agent LB pattern).
+  # Helm `set` requires escaped indices for list-of-string values.
+  dynamic "set" {
+    for_each = var.enable_ingress_gateway ? toset(var.ingress_gateway_source_ranges) : []
+    content {
+      name  = "ingressGateways.defaults.service.loadBalancerSourceRanges[${index(var.ingress_gateway_source_ranges, set.value)}]"
+      value = set.value
+    }
+  }
+
   depends_on = [
     kubernetes_secret.consul_ca_cert,
     kubernetes_secret.consul_bootstrap_token,
