@@ -52,6 +52,11 @@ build/
 
 # Claude Code — local settings (personal permissions, not shared)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/.qodo/
+
+# Run logs (deploy / destroy / smoke output captured by Taskfile)
+.runs/
 
 # Diagrams (generated — commit the PNGs not the intermediate files)
 docs/diagrams/*.svg

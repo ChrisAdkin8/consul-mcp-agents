@@ -13,16 +13,32 @@
 # =============================================================================
 
 locals {
+  # tags/meta surface in the Consul catalog (ServiceTags / ServiceMeta) for
+  # filterable ops queries, tag-scoped intentions, and future capability-based
+  # discovery. Routing remains static via connect-service-upstreams.
   mcp_servers = {
     "mcp-data-server" = {
       module          = "vault_mcp_agents.mcp.data_server"
       gcp_secret_path = "gcp/impersonated-account/data-agent-gcp/token"
       description     = "data (GCS + BigQuery)"
+      tags            = ["data", "gcs", "bigquery", "sql", "read-only"]
+      meta = {
+        domain       = "gcp-data"
+        capabilities = "list_buckets,read_object,run_query"
+        sql_dialect  = "bigquery-standard"
+        cost_capped  = "true"
+      }
     }
     "mcp-compute-server" = {
       module          = "vault_mcp_agents.mcp.compute_server"
       gcp_secret_path = "gcp/impersonated-account/compute-agent-gcp/token"
       description     = "compute (GCE)"
+      tags            = ["compute", "gce", "vm-lifecycle"]
+      meta = {
+        domain        = "gcp-compute"
+        capabilities  = "list_instances,start_instance,stop_instance,create_instance"
+        machine_types = "e2,n2"
+      }
     }
   }
 }
@@ -325,14 +341,18 @@ resource "kubernetes_deployment" "mcp_server" {
           "app.kubernetes.io/name"      = each.key
           "app.kubernetes.io/component" = "mcp-server"
         }
-        annotations = {
-          "consul.hashicorp.com/connect-inject"    = "true"
-          "consul.hashicorp.com/service-name"      = each.key
-          "consul.hashicorp.com/transparent-proxy" = "false"
-          "consul.hashicorp.com/service-port"      = "8080"
+        annotations = merge(
+          {
+            "consul.hashicorp.com/connect-inject"    = "true"
+            "consul.hashicorp.com/service-name"      = each.key
+            "consul.hashicorp.com/transparent-proxy" = "false"
+            "consul.hashicorp.com/service-port"      = "8080"
+            "consul.hashicorp.com/service-tags"      = join(",", each.value.tags)
 
-          "checksum/vault-agent-config" = sha256(kubernetes_config_map.vault_agent_server[each.key].data["vault-agent.hcl"])
-        }
+            "checksum/vault-agent-config" = sha256(kubernetes_config_map.vault_agent_server[each.key].data["vault-agent.hcl"])
+          },
+          { for k, v in each.value.meta : "consul.hashicorp.com/service-meta-${k}" => v },
+        )
       }
 
       spec {

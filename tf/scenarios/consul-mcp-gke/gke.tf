@@ -31,9 +31,10 @@ module "gke" {
   authorized_networks     = var.gke_authorized_cidrs
 
   # Cluster lifecycle and security
-  deletion_protection           = var.gke_deletion_protection
-  database_encryption_key       = var.gke_database_encryption_key
-  ingress_gateway_source_ranges = var.allowed_ingress_cidrs
+  deletion_protection               = var.gke_deletion_protection
+  enable_master_authorized_networks = var.gke_enable_master_authorized_networks
+  database_encryption_key           = var.gke_database_encryption_key
+  ingress_gateway_source_ranges     = var.allowed_ingress_cidrs
 
   # Workload Identity bindings — service_account_id requires full resource name
   data_agent_sa_name    = module.vault_config.data_agent_sa_name

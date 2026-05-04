@@ -11,11 +11,12 @@ gcp_zone       = "us-central1-a"
 environment    = "dev"
 
 # ---- HCP ----
-# Create a service principal in HCP portal → Access control → Service principals
-hcp_client_id     = "your-hcp-client-id"
-hcp_client_secret = "your-hcp-client-secret"
-hcp_hvn_cidr      = "172.25.16.0/20"  # Must not overlap GCP subnets
-hcp_vault_tier    = "plus_small"
+# Create a service principal in HCP portal → Access control → Service principals.
+# Do NOT put `hcp_client_secret` in this file. Provide it via env var:
+#   export TF_VAR_hcp_client_secret='...'
+hcp_client_id  = "your-hcp-client-id"
+hcp_hvn_cidr   = "172.25.16.0/20" # Must not overlap GCP subnets
+hcp_vault_tier = "plus_small"
 
 # ---- Network ----
 subnet_cidr   = "10.128.64.0/24"
@@ -39,9 +40,15 @@ gke_cluster_ready            = false
 gke_cluster_private_endpoint = ""   # Fill after phase 1: gcloud container clusters describe ... --format='value(privateClusterConfig.privateEndpoint)'
 token_reviewer_jwt           = ""   # Fill after phase 2: task vault:reviewer-jwt
 
+# gke_authorized_cidrs only takes effect when gke_enable_master_authorized_networks = true.
+# Default deployment leaves the master endpoint open to the internet because HCP Vault
+# Public Tier has no stable egress IPs to allowlist (see CLAUDE.md "Architectural gap").
+# To restrict: set the flag below to true and include both operator IP(s) and HCP egress
+# CIDRs (or stand up HVN→VPC peering and switch kubernetes_host to the private endpoint).
 gke_authorized_cidrs = [
   { cidr = "YOUR_IP/32", name = "operator-workstation" },
 ]
+gke_enable_master_authorized_networks = false
 
 # ---- LLM ----
 llm_provider     = "anthropic"

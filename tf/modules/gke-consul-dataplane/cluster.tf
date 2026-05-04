@@ -43,16 +43,19 @@ resource "google_container_cluster" "main" {
     master_ipv4_cidr_block  = var.master_cidr
   }
 
-  master_authorized_networks_config {
-    cidr_blocks {
-      cidr_block   = var.subnet_cidr
-      display_name = "Internal subnet"
-    }
-    dynamic "cidr_blocks" {
-      for_each = var.authorized_networks
-      content {
-        cidr_block   = cidr_blocks.value.cidr
-        display_name = cidr_blocks.value.name
+  dynamic "master_authorized_networks_config" {
+    for_each = var.enable_master_authorized_networks ? [1] : []
+    content {
+      cidr_blocks {
+        cidr_block   = var.subnet_cidr
+        display_name = "Internal subnet"
+      }
+      dynamic "cidr_blocks" {
+        for_each = var.authorized_networks
+        content {
+          cidr_block   = cidr_blocks.value.cidr
+          display_name = cidr_blocks.value.name
+        }
       }
     }
   }

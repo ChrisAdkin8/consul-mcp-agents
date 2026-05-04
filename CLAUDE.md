@@ -6,9 +6,14 @@ Vault PKI CA + dynamic GCP credentials, Consul mTLS mesh, LangChain agents on GK
 ## Commands
 
 ```sh
+# Required env var (replaces hcp_client_secret in tfvars)
+export TF_VAR_hcp_client_secret='...'    # HCP service-principal secret
+
 task --list              # show all tasks
 task tf:plan             # plan with var file
 task tf:apply            # docker rebuild + full apply
+task smoke               # end-to-end functional smoke test, PASS/FAIL/SKIP report
+task hcp:list-orphans    # find leaked random_pet HVNs from prior runs
 task consul:bootstrap-acl       # bootstrap Consul ACLs (idempotent); always syncs K8s secret
 task consul:verify-auth-method  # confirm consul-k8s-component-auth-method exists on server
 task consul:helm-clean          # uninstall Consul Helm + delete namespace (clean retry)
@@ -22,6 +27,7 @@ tflint --config .tflint.hcl --chdir tf/scenarios/consul-mcp-gke  # local lint
 - **Module inputs**: all modules expose `project_id`, `region`, `environment`
 - **Naming**: `{environment}-{component}-{resource}`
 - **No default credentials**: `vault_users`, `mcp_ttyd_credential`, `allowed_ingress_cidrs` must be set in tfvars. Validation rejects `0.0.0.0/0`.
+- **`hcp_client_secret` lives in env, not tfvars**: Terraform reads `TF_VAR_hcp_client_secret`; tasks that hit the HCP REST API directly (`smoke`, `hcp:list-orphans`) read the same var via `scripts/hcp-token.sh`. The shell `export` is the only ergonomic way; do not re-introduce the secret to `terraform.tfvars`.
 - **Sensitive vars need taint**: Terraform won't detect changes to `sensitive = true` fields. Use `terraform taint <resource>` then apply.
 - Always run `terraform fmt -recursive` before committing
 - GKE uses native `google_container_cluster` / `google_container_node_pool` — do not migrate to community module
@@ -47,7 +53,24 @@ tflint --config .tflint.hcl --chdir tf/scenarios/consul-mcp-gke  # local lint
 | `mcp-data-server` | GCS + BigQuery MCP (SSE) | 8080 |
 | `mcp-compute-server` | GCE MCP (SSE) | 8080 |
 
-**Adding a new MCP server**: add entry to `local.mcp_servers` in `deployment.tf`, add upstream to agent annotation, add to `mcp_servers` map in `kv.tf` `yamlencode()` block. The `for_each` creates deployment, service, PDB, SA, ConfigMap, and intention automatically.
+**Adding a new MCP server**: add entry to `local.mcp_servers` in `deployment.tf` (including `tags` list and `meta` map — see below), add upstream to agent annotation, add to `mcp_servers` map in `kv.tf` `yamlencode()` block. The `for_each` creates deployment, service, PDB, SA, ConfigMap, and intention automatically.
+
+### Consul catalog metadata (tags + meta)
+
+Each MCP server registers with Consul carrying `ServiceTags` and `ServiceMeta` derived from `local.mcp_servers[*].tags` / `meta`. Annotations are emitted as `consul.hashicorp.com/service-tags` (comma-joined) and `consul.hashicorp.com/service-meta-<key>` (one per entry).
+
+What this gives us:
+1. **Self-documenting catalog** — `curl /v1/catalog/service/mcp-data-server | jq '.[0].ServiceMeta'` answers "what does this service do, what's it allowed to touch, is it cost-capped?" without reading Terraform or source. Useful for on-call, onboarding, and audit.
+2. **Filterable ops queries** — `consul catalog services -filter 'Meta.domain == "gcp-data"'`, Grafana labels keyed by `Meta.capabilities`, Consul-exporter metrics broken down by tag.
+3. **Tag-scoped intentions (latent)** — ServiceIntentions can match source/destination by tag, so future policies like "only `read-only` clients reach `mcp-data-server`" become one-line rules instead of per-service enumeration.
+4. **Migration-free Phase 2** — if a fourth server or multi-instance routing later forces capability-based discovery, the metadata is already in the catalog; no retrofit.
+
+What it does **not** give us: runtime behavior change (the agent still dials hardcoded `localhost:20000/20001` upstreams), new auth (`capabilities.yaml` still owns RBAC), or capability routing.
+
+Conventions when extending:
+- `tags` are short identifiers used for filtering/intentions (`read-only`, `gcs`, `vm-lifecycle`).
+- `meta.capabilities` is a CSV of MCP tool names; `meta.domain` is a single coarse-grained owner (`gcp-data`, `gcp-compute`); other meta keys are free-form but should be queryable (avoid embedding JSON).
+- Keep tags/meta in sync with the actual tools registered in the server's `list_tools()` — this is the contract the catalog publishes.
 
 ## Critical operational rules
 
@@ -82,12 +105,107 @@ task consul:refresh-tls
 kubectl rollout restart deployment -n consul
 ```
 
+### Recovery: full destroy → re-deploy (canonical sequence)
+
+A clean destroy of the audit-hardened (commit `32e412d`) stack requires neutralising **two** classes of protection before `task destroy`. Skipping either causes an interactive-looking failure mid-destroy. Restore both after destroy completes — Terraform applies will re-add them on the new resources.
+
+1. **Flip `prevent_destroy` on Vault stateful resources** (4 lines, all `prevent_destroy = true`):
+   - `tf/modules/vault-config/kv.tf` (KV mount)
+   - `tf/modules/vault-config/gcp-engine.tf` (GCP secret backend)
+   - `tf/modules/vault-pki-consul/pki.tf` (root + intermediate CA mounts — 2 lines)
+
+   Use a sentinel marker (`# TEMP-OVERRIDE-DESTROY`) so you can grep-restore them.
+
+2. **Set `gke_deletion_protection = false` in tfvars and apply the flag flip** (cluster-side `deletion_protection` is the real GCP-side block; Terraform's `prevent_destroy` is separate):
+   ```sh
+   echo 'gke_deletion_protection = false # TEMP-OVERRIDE-DESTROY' >> tf/scenarios/consul-mcp-gke/terraform.tfvars
+   terraform -chdir=tf/scenarios/consul-mcp-gke apply -auto-approve \
+     -target=module.gke.google_container_cluster.main
+   ```
+
+3. `task --yes destroy`
+
+4. After destroy succeeds, **restore everything**: revert all four `prevent_destroy` lines, remove the `gke_deletion_protection` line.
+
+### Recovery: network drop mid-apply (orphan resources, state lock, errored.tfstate)
+
+Long applies (HCP Vault provisioning ~10m, GKE ~8m, Helm ~5m) frequently lose connectivity to `storage.googleapis.com` or `container.googleapis.com`, leaving:
+- A stale `default.tflock` object in the GCS state bucket
+- An `errored.tfstate` file in the scenario dir
+- Possibly an orphan resource on the cloud side that's not in remote state
+
+Recovery sequence:
+```sh
+gsutil rm gs://<state-bucket>/terraform/consul-mcp-gke/default.tflock
+terraform -chdir=tf/scenarios/consul-mcp-gke state push tf/scenarios/consul-mcp-gke/errored.tfstate
+rm tf/scenarios/consul-mcp-gke/errored.tfstate
+```
+
+If a resource exists on the cloud but not in state (e.g., GCE VM, GKE cluster), either:
+- `terraform import <addr> <id>` (preferred, but may fail if any provider config is unresolvable — the helm/consul providers in `versions.tf` depend on apply-time values)
+- Or delete the orphan via `gcloud` and re-run the relevant phase to recreate
+
+### Recovery: tainted resource after partial create
+
+If terraform's apply was interrupted *after* a resource was created on the cloud but *before* state was saved, on the next plan the resource appears as **tainted** ("must be replaced"). For protected resources (`deletion_protection`, `prevent_destroy`) this surfaces as a confusing "cannot destroy" error during what looks like a creation flow. Verify the resource is actually healthy on the cloud, then `terraform untaint <addr>`.
+
+### Recovery: docker push hangs silently
+
+`docker push` can stall after appearing to push all layers (no error, just no progress). The push client output is **not** authoritative — check Artifact Registry directly:
+```sh
+gcloud artifacts docker tags list us-central1-docker.pkg.dev/<project>/<repo>/vault-mcp-agents
+```
+If the tag is missing, kill the stuck `docker push` PID and retry.
+
+### Recovery: Vault K8s auth — JWT field looks empty after taint+apply
+
+`token_reviewer_jwt` is a `sensitive` field, and Terraform won't always re-write it during a `taint` + targeted apply (the K8s auth backend config resource sometimes plans no change even when tainted). When pods show `Init:0/2` with `permission denied` on `auth/kubernetes/login`, fall back to writing all five fields directly:
+```sh
+vault write auth/kubernetes/config \
+  kubernetes_host="https://<gke-public-endpoint>:443" \
+  kubernetes_ca_cert="$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="<ctx>")].cluster.certificate-authority-data}' | base64 -d)" \
+  token_reviewer_jwt="$(kubectl get secret vault-reviewer-token -n kube-system -o jsonpath='{.data.token}' | base64 -d)" \
+  issuer="https://container.googleapis.com/v1/projects/<project>/locations/<region>/clusters/<cluster>" \
+  disable_iss_validation=true \
+  disable_local_ca_jwt=true
+```
+A read-back will show `token_reviewer_jwt` as length 0 (Vault never echoes it back) — that's expected. Verify by deleting the failing pods and watching them progress past Init.
+
+### HCP Vault → GKE master access (`gke_enable_master_authorized_networks`)
+
+The audit hardening (commit `32e412d`) added `master_authorized_networks_config` to the GKE cluster. With it enabled and only operator IPs in `gke_authorized_cidrs`, vault-agent-init pods get `permission denied` on `auth/kubernetes/login` because HCP Vault's TokenReview call to the K8s API is blocked — HCP Vault Public Tier has no stable egress IPs to allowlist, and no HVN→VPC peering exists in this scenario (`module.hcp_vault.hcp_hvn.main` is created but no `hcp_*_network_peering` resource), so the private-endpoint path doesn't work either.
+
+The block is now controlled by `gke_enable_master_authorized_networks` (scenario var → `enable_master_authorized_networks` on the module), wrapping `master_authorized_networks_config` in a `dynamic` block. **Default is `false`** — master endpoint open to the internet, matching the pre-audit behaviour. Set true once you've solved the connectivity in one of two ways:
+
+1. **HVN-VPC peering** (proper fix): add `hcp_*_network_peering` + Cloud Router routes so the HVN can reach the GKE master CIDR over private peering, then point `kubernetes_host` at the private endpoint. Then set `gke_enable_master_authorized_networks = true` and leave `gke_authorized_cidrs` operator-only.
+2. **HCP Plus-tier egress CIDRs** (allowlist): HashiCorp publishes per-region egress CIDRs for Plus-tier clusters; add them to `gke_authorized_cidrs` alongside the operator IP, then set `gke_enable_master_authorized_networks = true`. (Note: HashiCorp may rotate these.)
+
+### Recovery: Vault auth role policies / audience
+
+The two K8s auth roles (`mcp-agent`, `mcp-server`) both reference policy `mcp-server-policy` (singular policy serves both). If either role ends up with a missing/wrong policy, vault-agent will authenticate but get `permission denied` on subsequent secret reads (`secret/data/mcp-agents/{config,policies,llm-keys}`). Audience must remain **unset** on the role: the projected SA token volume mounts use `audience: "vault"`, but Vault validates audience locally and rejects when role's `audience` is set on this GKE OIDC issuer (`invalid audience (aud) claim`). Direct fix:
+```sh
+vault write auth/kubernetes/role/mcp-agent \
+  bound_service_account_names=mcp-agent \
+  bound_service_account_namespaces=mcp-agents \
+  token_policies="default,mcp-server-policy" token_ttl=1h token_max_ttl=24h
+vault write auth/kubernetes/role/mcp-server \
+  bound_service_account_names="mcp-server,mcp-data-server,mcp-compute-server" \
+  bound_service_account_namespaces=mcp-agents \
+  token_policies="default,mcp-server-policy" token_ttl=1h token_max_ttl=24h
+```
+
+### Operator IP rotation: two CIDR fields, only one auto-syncs
+
+`task ingress:sync-ip` only updates `allowed_ingress_cidrs` (LoadBalancer source ranges). `gke_authorized_cidrs` (master_authorized_networks) does **not** auto-sync — when the operator's public IP rotates, kubectl breaks silently with `i/o timeout` to the master endpoint. Either run `task ingress:sync-ip` then manually update `gke_authorized_cidrs` and `terraform apply -target=module.gke.google_container_cluster.main`, or fix `scripts/ingress-sync-ip.sh` (extension) to update both.
+
 ### Vault-agent HCL heredoc bug
 - **Do NOT use `<<-TMPL` heredocs in vault-agent templates to render YAML/config files.** Vault-agent's HCL parser corrupts indentation: lines after the first get spurious extra whitespace, producing invalid YAML. Use `yamlencode()` in Terraform to store the complete YAML as a single KV string, and a one-liner vault-agent template to read/write it: `"{{ with secret \"path\" }}{{ .Data.data.settings_yaml }}{{ end }}"`.
 - The KV secrets `mcp-agents/config` and `mcp-agents/policies` each store a single pre-rendered YAML field (`settings_yaml` / `policies_yaml`), not individual config fields.
 
 ### Provider gotchas
-- **HCP Vault admin token expires in 6h** — re-run `terraform apply -target=module.hcp_vault` to regenerate
+- **HCP Vault admin token expires in 6h** — `terraform apply -target=module.hcp_vault.hcp_vault_cluster_admin_token.main` will *not* refresh it on its own (terraform sees no diff). Force regen via `terraform taint module.hcp_vault.hcp_vault_cluster_admin_token.main` then `terraform apply -target=...` — confirmed by "1 added, 1 destroyed" on apply.
+- **`terraform init -upgrade` queries the registry every run** — when the Terraform Registry is flaky (frequent `context deadline exceeded`), init fails even though all providers are already cached locally. Workaround for transient outages: run `terraform -chdir=tf/scenarios/consul-mcp-gke init -backend-config="bucket=..."` (without `-upgrade`) once to satisfy `tf:init`, then re-run the phase task.
+- **HCP HVN org quota** — the org has a hard cap on concurrent HVNs (failure mode: `HVN quota reached, quota_value: "0"`). Each `terraform apply` creates one HVN named `${random_pet.prefix}-hvn`; if `terraform destroy` is skipped, every prior run leaves an orphan HVN + Vault cluster. Before applying, run `task hcp:list-orphans` to surface random_pet-shaped HVNs (`^[a-z]+-[a-z]+-hvn$`); delete unused pairs (cluster first, then HVN) via the HCP UI or API. Do **not** delete HVNs whose names don't match the random_pet pattern — they belong to other demos.
 - **Consul provider needs IAP tunnel** — `task consul:tunnel` first, set `consul_address_override = "https://localhost:18501"` with `insecure_https = true`
 - **K8s provider identity bug**: `terraform apply`/`destroy` may hit `Unexpected Identity Change`. The fix script (`tf-fix-k8s-identity.sh`) unconditionally removes all matched resources from state before apply/destroy — Terraform recreates them cleanly. Runs automatically in `phase3:apply` (scoped to `consul_` resources only); for destroy use `task tf:fix-k8s-identity`. **IMPORTANT**: When passing custom patterns to the script, scope to the specific resource type affected (e.g. `consul_`), not the entire module — removing all K8s resources from state forces re-import of every deployment, service, configmap, PDB, and SA.
 

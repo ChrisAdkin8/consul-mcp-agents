@@ -60,10 +60,10 @@ output "deployment_summary" {
     MCP Agent Replicas: ${var.mcp_replicas}
 
     Next steps:
-      1. task vault:configure-k8s-auth  (after GKE is ready)
-      2. task mcp:docker:push           (build and push agent image)
-      3. task phase3:apply              (deploy MCP agents to GKE)
-      4. kubectl get svc mcp-agent -n mcp-agents  (get web terminal URL)
+      • Fresh deploy:    task all
+      • MCP agents only: task phase3:apply  (after Phase 2 has run)
+      • Smoke test:      task smoke
+      • Web terminal:    task mcp:url
     ============================================================
   EOT
 }

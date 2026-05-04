@@ -22,4 +22,11 @@ resource "consul_config_entry_service_intentions" "mcp_server" {
     name   = "mcp-agent"
     action = "allow"
   }
+
+  # Consul computes `precedence` server-side from source/destination wildcard
+  # specificity and reads it back; the provider would otherwise show recurring
+  # `precedence: 9 -> null` drift on every plan.
+  lifecycle {
+    ignore_changes = [sources[0].precedence]
+  }
 }

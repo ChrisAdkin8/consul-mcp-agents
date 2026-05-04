@@ -258,7 +258,7 @@ variable "gke_master_cidr" {
 }
 
 variable "gke_authorized_cidrs" {
-  description = "Additional CIDRs allowed to reach the GKE API server (e.g. operator workstation IPs). 0.0.0.0/0 is rejected."
+  description = "Additional CIDRs allowed to reach the GKE API server (e.g. operator workstation IPs). Only applied when gke_enable_master_authorized_networks = true. 0.0.0.0/0 is rejected."
   type = list(object({
     cidr = string
     name = string
@@ -269,6 +269,12 @@ variable "gke_authorized_cidrs" {
     condition     = !contains([for c in var.gke_authorized_cidrs : c.cidr], "0.0.0.0/0")
     error_message = "gke_authorized_cidrs must not contain 0.0.0.0/0. Specify explicit operator and HCP Vault CIDRs."
   }
+}
+
+variable "gke_enable_master_authorized_networks" {
+  description = "Restrict GKE master endpoint to gke_authorized_cidrs + internal subnet. Default false: HCP Vault Public Tier has no stable egress IPs to allowlist, and no HVN→VPC peering exists, so vault-agent-init pods can't auth when restricted. See CLAUDE.md 'Architectural gap: HCP Vault → GKE master access'."
+  type        = bool
+  default     = false
 }
 
 variable "gke_deletion_protection" {

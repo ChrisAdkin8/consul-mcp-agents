@@ -2,33 +2,21 @@
 # HCP Vault Dedicated Module — main.tf
 #
 # Provisions:
-#   • HCP HashiCorp Virtual Network (HVN) in GCP
+#   • HCP HashiCorp Virtual Network (HVN) on AWS
 #   • HCP Vault Dedicated cluster (Plus tier for Vault Enterprise features)
-#   • GCP VPC peering from HVN to the deployment VPC
 #   • Admin token for subsequent Vault configuration
 #
-# The HVN is the network boundary inside HashiCorp Cloud Platform. Traffic
-# between the HVN and your GCP VPC flows over a private peering connection,
-# which means Consul VMs and GKE pods reach Vault on an RFC-1918 address
-# rather than over the public internet.
-#
-# Usage:
-#   module "hcp_vault" {
-#     source             = "../../modules/hcp-vault"
-#     hvn_id             = "vault-mcp-hvn"
-#     cluster_id         = "vault-mcp-cluster"
-#     region             = "us-central1"
-#     hvn_cidr           = "172.25.16.0/20"
-#     gcp_project_id     = var.gcp_project_id
-#     gcp_network_name   = module.network.network_name
-#   }
+# Networking model: HCP Vault Dedicated does not support direct VPC peering
+# to GCP, so the HVN is provisioned on AWS and GCP workloads (Consul VMs,
+# GKE pods) reach Vault over its public endpoint (with `allowed_ingress_cidrs`
+# enforcing source-IP restrictions on the public LB at the GCP side).
+# The HVN's `cidr_block` therefore only needs to avoid colliding with other
+# AWS HVNs in the org; it does not need to be coordinated with GCP CIDRs.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # HCP HashiCorp Virtual Network (HVN)
-# The HVN is the HCP-managed VPC equivalent. It must be in the same GCP
-# region as your workloads to minimise latency and avoid egress charges.
-# The CIDR must not overlap any GCP subnet used by Consul VMs or GKE pods.
+# Hosted on AWS — see module-level comment above for why this isn't GCP.
 # ---------------------------------------------------------------------------
 resource "hcp_hvn" "main" {
   hvn_id         = var.hvn_id

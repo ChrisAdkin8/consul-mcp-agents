@@ -257,6 +257,23 @@ variable "database_encryption_key" {
   default     = ""
 }
 
+variable "enable_master_authorized_networks" {
+  description = <<-EOT
+    Restrict GKE master endpoint access to specific CIDRs. When true, only
+    `subnet_cidr` (internal) plus `authorized_networks` can reach the API
+    server. When false (default), the master is reachable from any source.
+
+    Default false because HCP Vault Public Tier has no stable egress IPs to
+    allowlist, and no HVN→VPC peering with route to the GKE master CIDR is
+    configured by this scenario. Vault's K8s auth (TokenReview API call) would
+    fail under restricted master_authorized_networks. Set true once you have
+    either added HCP egress CIDRs to `authorized_networks` or stood up
+    HVN→VPC peering and switched `kubernetes_host` to the private endpoint.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "ingress_gateway_source_ranges" {
   description = "CIDR ranges allowed to reach the Consul ingress gateway LoadBalancer. Must be set when enable_ingress_gateway=true."
   type        = list(string)
