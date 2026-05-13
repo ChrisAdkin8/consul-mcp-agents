@@ -1,5 +1,10 @@
 # =============================================================================
-# config/settings.yaml — bundled default for local development
+# config/settings.yaml — bundled default
+#
+# All agent↔MCP-server traffic flows through the Consul service mesh. The
+# agent pod's Envoy sidecar exposes each MCP server as a Consul Connect
+# upstream listener on localhost (data:20000, compute:20001). There is no
+# stdio/subprocess transport — the agent must run in a pod with a sidecar.
 #
 # In production, vault-agent renders the authoritative version of this file
 # from Vault KV (secret/data/mcp-agents/config) to /vault/secrets/settings.yaml
@@ -32,20 +37,12 @@ agents:
     mcp_server: "compute_server"
     gcp_impersonated_account: "compute-agent-gcp"
 
-# Local dev: stdio (subprocess). GKE: sse (separate pods via Consul mesh).
+# Each url is the Consul Connect upstream listener on the agent pod's Envoy
+# sidecar (declared via `consul.hashicorp.com/connect-service-upstreams`).
+# Envoy terminates the agent-side TLS and dials the destination service's
+# sidecar over mTLS through the mesh — auth gated by Consul ServiceIntentions.
 mcp_servers:
   data_server:
-    transport: stdio
-    command: python
-    args: ["-m", "vault_mcp_agents.mcp.data_server"]
+    url: "http://localhost:20000/sse"
   compute_server:
-    transport: stdio
-    command: python
-    args: ["-m", "vault_mcp_agents.mcp.compute_server"]
-  # GKE example (Consul Connect upstreams on localhost):
-  # data_server:
-  #   transport: sse
-  #   url: "http://localhost:20000/sse"
-  # compute_server:
-  #   transport: sse
-  #   url: "http://localhost:20001/sse"
+    url: "http://localhost:20001/sse"

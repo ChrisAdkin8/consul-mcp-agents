@@ -13,8 +13,7 @@ import anthropic
 import openai
 from contextlib import asynccontextmanager
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp import ClientSession
 from mcp.client.sse import sse_client
 from rich.console import Console
 from rich.prompt import Prompt
@@ -254,7 +253,6 @@ async def run_agent_session(config: Path, policies: Path) -> None:
     console.print(f"Role: [bold yellow]{role}[/bold yellow]")
 
     agent_name, mcp_server_name = _select_agent(settings, role, policy_set)
-    agent_def = settings.agents[agent_name]
     mcp_server_def = settings.mcp_servers.get(mcp_server_name)
 
     if mcp_server_def is None:
@@ -267,40 +265,18 @@ async def run_agent_session(config: Path, policies: Path) -> None:
     if role_policy and agent_name in role_policy.agents:
         allowed_tools = role_policy.agents[agent_name].allowed_tools
 
-    # Try to obtain a GCP access token from Vault for GCP API calls
-    gcp_token = vault.generate_gcp_token(
-        gcp_mount=settings.vault.gcp_secrets_mount,
-        roleset=agent_def.gcp_impersonated_account,
-    )
-
-    server_env = {**os.environ}
-    if gcp_token:
-        server_env["GOOGLE_ACCESS_TOKEN"] = gcp_token
-        console.print("[dim]GCP access token obtained from Vault.[/dim]")
-    else:
-        console.print("[dim]GCP token unavailable — MCP server will use ADC.[/dim]")
-
-    server_env["GCP_PROJECT_ID"] = settings.gcp.project_id
-
     console.print(
         f"\n[bold]Starting agent:[/bold] [cyan]{agent_name}[/cyan] "
         f"via MCP server [cyan]{mcp_server_name}[/cyan]"
     )
+    console.print(
+        f"[dim]Connecting via Consul mesh (SSE upstream): {mcp_server_def.url}[/dim]"
+    )
 
     @asynccontextmanager
     async def _connect():
-        if mcp_server_def.transport == "sse" and mcp_server_def.url:
-            console.print(f"[dim]Connecting to MCP server via SSE: {mcp_server_def.url}[/dim]")
-            async with sse_client(mcp_server_def.url, timeout=30) as (read, write):
-                yield read, write
-        else:
-            server_params = StdioServerParameters(
-                command=mcp_server_def.command,
-                args=mcp_server_def.args,
-                env=server_env,
-            )
-            async with stdio_client(server_params) as (read, write):
-                yield read, write
+        async with sse_client(mcp_server_def.url, timeout=30) as (read, write):
+            yield read, write
 
     async with _connect() as (read, write):
         async with ClientSession(read, write) as mcp_session:

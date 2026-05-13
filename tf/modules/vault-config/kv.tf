@@ -74,14 +74,15 @@ resource "vault_kv_secret_v2" "mcp_config" {
           gcp_impersonated_account = "compute-agent-gcp"
         }
       }
+      # All agent↔server traffic goes through the Consul mesh — each URL is
+      # the Envoy sidecar's upstream listener on localhost (see deployment.tf
+      # `consul.hashicorp.com/connect-service-upstreams`).
       mcp_servers = {
         data_server = {
-          transport = "sse"
-          url       = "http://localhost:20000/sse"
+          url = "http://localhost:20000/sse"
         }
         compute_server = {
-          transport = "sse"
-          url       = "http://localhost:20001/sse"
+          url = "http://localhost:20001/sse"
         }
       }
     })

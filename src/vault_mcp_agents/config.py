@@ -40,9 +40,6 @@ class AgentDef:
 
 @dataclass
 class McpServerDef:
-    transport: str = "stdio"
-    command: str = "python"
-    args: list[str] = field(default_factory=list)
     url: str = ""
 
 
@@ -115,12 +112,13 @@ def load_settings(path: Path) -> Settings:
 
     mcp_servers: dict[str, McpServerDef] = {}
     for name, sdef in raw.get("mcp_servers", {}).items():
-        mcp_servers[name] = McpServerDef(
-            transport=sdef.get("transport", "stdio"),
-            command=sdef.get("command", "python"),
-            args=sdef.get("args", []),
-            url=sdef.get("url", ""),
-        )
+        url = sdef.get("url", "")
+        if not url:
+            raise ValueError(
+                f"mcp_servers.{name}.url is required — all agent↔server "
+                "traffic flows through the Consul mesh (SSE upstream listener)."
+            )
+        mcp_servers[name] = McpServerDef(url=url)
 
     return Settings(vault=vault, gcp=gcp, llm=llm, agents=agents, mcp_servers=mcp_servers)
 
