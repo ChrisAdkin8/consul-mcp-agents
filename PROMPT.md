@@ -6,7 +6,7 @@ This prompt contains enough detail to recreate the entire consul-mcp-agents repo
 
 ## 1. Project Overview
 
-Build a production-grade infrastructure project that deploys LangChain-based AI agents on GKE, secured by Consul service mesh (mTLS) and HCP Vault Dedicated (PKI CA + dynamic GCP credentials). The agents interact with GCP services (GCS, BigQuery, GCE) via MCP (Model Context Protocol) servers. Access control is enforced at three layers: Vault policies (per-user), Consul intentions (per-service), and LLM tool filtering (per-role).
+Build a production-grade infrastructure project that deploys MCP-driven AI agents on GKE, secured by Consul service mesh (mTLS) and HCP Vault Dedicated (PKI CA + dynamic GCP credentials). The agents talk to Anthropic or OpenAI via their official SDKs (no LangChain) and reach GCP services (GCS, BigQuery, GCE) through MCP (Model Context Protocol) tool servers. Access control is enforced at three layers: Vault policies (per-user), Consul intentions (per-service), and LLM tool filtering (per-role).
 
 ### High-level architecture
 
@@ -14,8 +14,9 @@ Build a production-grade infrastructure project that deploys LangChain-based AI 
 User (browser) → ttyd web terminal → vault-mcp-agents CLI
   → Vault userpass login → role determination (operator/analyst/viewer)
   → Agent selection (data_agent or compute_agent)
-  → Vault GCP token generation (5-min OAuth2 via impersonation)
-  → MCP connection (stdio subprocess or SSE via Consul Connect)
+  → MCP connection: SSE through Envoy sidecar upstream (localhost:20000/20001)
+    → Consul Connect mTLS → MCP server pod (ServiceIntention enforced)
+  → MCP server fetches 5-min GCP OAuth2 token from its own vault-agent file
   → LLM REPL (Anthropic Claude or OpenAI) with filtered tool list
   → MCP tool calls → GCP API operations → results back to user
 ```
@@ -371,7 +372,7 @@ Dataclass-based configuration with YAML loader:
 - `GcpConfig` — project_id, region
 - `LlmConfig` — provider (anthropic/openai), model, temperature
 - `AgentDef` — description, mcp_server (reference key), gcp_impersonated_account (Vault roleset name)
-- `McpServerDef` — transport (stdio/sse), command, args, url
+- `McpServerDef` — `url` (required) — the local Envoy upstream listener URL (e.g. `http://localhost:20000/sse`). Loader rejects empty `url`.
 - `Settings` — vault, gcp, llm, agents (dict), mcp_servers (dict)
 - `AgentRolePolicy` — allowed_tools (list), max_gcp_token_ttl
 - `RolePolicy` — vault_policy, agents (dict of AgentRolePolicy)
@@ -403,12 +404,9 @@ Main function: `async def run_agent_session(config: Path, policies: Path) -> Non
 4. `vault.determine_role(policies)` → operator/analyst/viewer (exit if unrecognized)
 5. `_select_agent(settings, role, policies)` → numbered menu of available agents for role
 6. Look up `AgentRolePolicy.allowed_tools` for selected agent+role
-7. `vault.generate_gcp_token(gcp_mount, gcp_impersonated_account)` → set `GOOGLE_ACCESS_TOKEN` + `GCP_PROJECT_ID` env vars
-8. `_connect()` — asynccontextmanager:
-   - If `transport == "sse"` and url set → `sse_client(url)` (HTTP to remote server)
-   - Else → `stdio_client(StdioServerParameters(command, args, env))` (subprocess)
-9. `ClientSession(read, write)` → `session.initialize()`
-10. Select REPL based on `settings.llm.provider`:
+7. `_connect()` — asynccontextmanager: `sse_client(mcp_server_def.url, timeout=30)` against the local Envoy upstream listener. There is no stdio fallback; the agent must run in a pod (or any host) with a Consul dataplane sidecar bound to that port.
+8. `ClientSession(read, write)` → `session.initialize()`
+9. Select REPL based on `settings.llm.provider`:
     - `_run_anthropic_repl(session, allowed_tools, model, temperature, api_key)`
     - `_run_openai_repl(session, allowed_tools, model, temperature, api_key)`
 
@@ -511,18 +509,16 @@ agents:
     mcp_server: "compute_server"
     gcp_impersonated_account: "compute-agent-gcp"
 
+# Each url is the Consul Connect upstream listener on the agent pod's Envoy
+# sidecar (declared via consul.hashicorp.com/connect-service-upstreams).
 mcp_servers:
   data_server:
-    transport: stdio
-    command: python
-    args: ["-m", "vault_mcp_agents.mcp.data_server"]
+    url: "http://localhost:20000/sse"
   compute_server:
-    transport: stdio
-    command: python
-    args: ["-m", "vault_mcp_agents.mcp.compute_server"]
+    url: "http://localhost:20001/sse"
 ```
 
-GKE variant (rendered by vault-agent): `transport: sse`, `url: "http://localhost:20000/sse"` (data) / `"http://localhost:20001/sse"` (compute).
+There is no stdio/subprocess transport. In production this file is rendered by vault-agent from Vault KV (`secret/data/mcp-agents/config`); the bundled copy in `config/settings.yaml` is the same shape.
 
 ### 5.2 policies/capabilities.yaml
 
@@ -670,7 +666,7 @@ Color palette: Vault purple, HCP teal, Consul pink, GCP blue, GKE green, MCP ora
 
 2. **Vault PKI as Consul Connect CA** (not Consul built-in) — centralized certificate management, CRL/OCSP revocation, consistent PKI hierarchy across services, audit logging.
 
-3. **Three separate deployments** (not one pod) — SSE transport requires separate network endpoints for Consul service mesh intentions. Stdio mode uses subprocess within agent pod; SSE mode uses Consul Connect upstreams to separate pods.
+3. **Three separate deployments** (not one pod) — each MCP server is its own service in the Consul catalog so `ServiceIntentions` can authorise the agent→server hop, the data and compute servers can be scaled and rotated independently, and a compromised server pod cannot read the others' Vault-rendered GCP tokens.
 
 4. **RBAC at LLM level** (not MCP API level) — simpler implementation, MCP servers are generic. Tool list filtered before passing to LLM. Trust model: Consul intentions prevent unauthorized service-to-service access; within an authorized connection, tool filtering is advisory (enforced by LLM prompt, not API).
 

@@ -1,7 +1,7 @@
 # CLAUDE.md — consul-mcp-agents
 
 GKE + Consul Dataplane + HCP Vault Dedicated + MCP AI Agents.
-Vault PKI CA + dynamic GCP credentials, Consul mTLS mesh, LangChain agents on GKE.
+Vault PKI CA + dynamic GCP credentials, Consul mTLS mesh, MCP-driven AI agents on GKE.
 
 ## Commands
 
@@ -44,14 +44,15 @@ tflint --config .tflint.hcl --chdir tf/scenarios/consul-mcp-gke  # local lint
 
 ## Service mesh architecture
 
-- **Local/stdio**: MCP servers as subprocesses (`transport: stdio`). For local dev.
-- **GKE/SSE**: Separate K8s Deployments. Agent connects via Consul upstreams on `localhost:20000` (data), `localhost:20001` (compute).
+All agent↔MCP-server traffic flows through the Consul service mesh — there is no stdio/subprocess transport. The agent runs as a GKE pod with an Envoy sidecar; the sidecar exposes each MCP server as a Consul Connect upstream listener on `localhost:20000` (data) / `localhost:20001` (compute), and Envoy terminates the agent-side TLS and dials the destination service's sidecar over mTLS through the mesh. Authorisation is gated by Consul `ServiceIntentions`.
 
 | Deployment | Purpose | Port |
 |---|---|---|
 | `mcp-agent` | CLI + ttyd web terminal | 7681 |
 | `mcp-data-server` | GCS + BigQuery MCP (SSE) | 8080 |
 | `mcp-compute-server` | GCE MCP (SSE) | 8080 |
+
+The agent reads `mcp_servers` from `settings.yaml` as `{name: {url}}` — a single URL pointing at the local upstream listener. The MCP servers themselves still honour `MCP_TRANSPORT=stdio|sse` as a debug knob (the K8s manifest always sets `sse`); the agent has no such knob.
 
 **Adding a new MCP server**: add entry to `local.mcp_servers` in `deployment.tf` (including `tags` list and `meta` map — see below), add upstream to agent annotation, add to `mcp_servers` map in `kv.tf` `yamlencode()` block. The `for_each` creates deployment, service, PDB, SA, ConfigMap, and intention automatically.
 

@@ -1,8 +1,32 @@
 # consul-mcp-agents
 
-**GKE + Consul Dataplane + HCP Vault Dedicated + MCP AI Agents**
+**GKE + Consul service mesh + HCP Vault Dedicated + MCP AI agents on GCP.**
 
-A production-grade infrastructure stack that deploys Vault-secured AI agents with MCP (Model Context Protocol) servers onto GKE, using HCP Vault Dedicated as both a Certificate Authority for Consul and a dynamic credential broker for GCP APIs.
+An end-to-end reference stack for running LLM agents that touch real cloud APIs, with **zero long-lived credentials**, **mTLS on every hop**, and **5-minute GCP tokens**. HCP Vault Dedicated is both the certificate authority for the Consul Connect mesh and a dynamic broker for GCP OAuth2 tokens; the Consul control plane runs on GCE VMs while the dataplane (Envoy sidecars) runs in GKE; the AI agents and their MCP tool servers are separate pods that talk to each other only through the mesh.
+
+### What you get
+
+- **An AI agent web terminal** (ttyd) where authenticated users drive an LLM with role-scoped tools against GCS, BigQuery, and Compute Engine.
+- **Three trust boundaries between user prompt and a GCP API call**: Vault userpass (who you are) → Consul intentions (which services may speak) → `capabilities.yaml` (which tools the LLM sees).
+- **No secrets in images, manifests, or environment variables** — every credential is rendered by vault-agent into tmpfs and rotated under TTL.
+- **A turn-key deployment**: ~25–35 min from `task all` to a working web terminal, with phase-gated Terraform that handles HCP Vault → Vault PKI → Consul VMs → GKE → MCP pods in the right order.
+
+### Who it's for
+
+Platform engineers and security architects evaluating how to give LLM agents real cloud capabilities without handing out static API keys; HashiCorp customers wanting an opinionated reference for HCP Vault + Consul + GKE; teams who want a working artefact to fork rather than a slideware diagram.
+
+### Table of contents
+
+- [Architecture](#architecture) — component stack, certificate chain, credential flow, what lives in Vault
+- [How Vault Brokers Secrets to Agents and MCP Servers](#how-vault-brokers-secrets-to-agents-and-mcp-servers) — per-pod auth, what gets rendered, secret lifetimes
+- [Vault ↔ Consul Integration](#vault--consul-integration) — Vault PKI as Connect CA, vault-agent on Consul VMs, cert renewal
+- [Prerequisites](#prerequisites) — tools, GCP setup, HCP setup
+- [Quick Start](#quick-start) — clone, configure, deploy, log in
+- [Deployment Phases](#deployment-phases) — why the apply is split, in what order
+- [Individual Component Operations](#individual-component-operations) — Taskfile commands per component
+- [Directory Structure](#directory-structure)
+- [Security Design](#security-design)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -19,8 +43,8 @@ A production-grade infrastructure stack that deploys Vault-secured AI agents wit
 | Control Plane | Consul VMs (external) | External Consul control plane for GKE dataplane mode |
 | Compute | GKE (regional cluster) | Runs MCP agent pods; Consul dataplane in sidecar proxies |
 | Credentials | Vault GCP Secrets Engine | 5-minute OAuth2 tokens via service account impersonation |
-| Agent AI | vault-mcp-agents (Python) | LangChain agents + MCP servers (GCS, BigQuery, GCE tools) |
-| User Access | ttyd web terminal | Browser-based CLI access; existing prompt/cli.py unchanged |
+| Agent AI | vault-mcp-agents (Python) | Anthropic/OpenAI SDK adapter + MCP tool servers (GCS, BigQuery, GCE) |
+| User Access | ttyd web terminal | Browser-based access to the `vault-mcp-agents` CLI inside the pod |
 
 ### Certificate Chain
 
@@ -36,12 +60,16 @@ HCP Vault PKI
 
 ```
 User → Vault userpass login → Session token
-  → LangChain agent → MCP server → _get_gcp_token()
-  → hvac.secrets.gcp.generate_impersonated_account_oauth2_access_token()
-  → Vault GCP engine → GCP generateAccessToken API
-  → OAuth2 token (TTL: 5 min, enforced at two layers)
+  → Agent selects role + agent, opens MCP connection over the Consul mesh
+  → (mTLS hop through Envoy sidecars; ServiceIntention authorises)
+  → MCP server pod calls tool handler
+  → Reads /vault/secrets/gcp-token (refreshed by its vault-agent sidecar)
+  → Token came from: Vault GCP secrets engine → GCP generateAccessToken API
+  → OAuth2 token (TTL: 5 min, enforced server-side by Vault lease)
   → GCS / BigQuery / GCE API call
 ```
+
+The agent process never fetches GCP credentials itself. Each MCP server pod owns its own Vault role and its own GCP impersonation chain — the agent's compromise blast radius is "issue MCP RPCs the intentions allow," not "mint GCP tokens."
 
 ### What Lives in Vault
 
@@ -61,13 +89,20 @@ User → Vault userpass login → Session token
 
 ---
 
-## How Pods Retrieve Secrets from Vault
+## How Vault Brokers Secrets to Agents and MCP Servers
 
-Secret delivery is split across two phases: **pod startup** (vault-agent init container) and **runtime** (Python hvac calls per user session).
+Two distinct pod types live in the `mcp-agents` namespace and they consume Vault differently:
 
-### Phase 1 — vault-agent init container
+| Pod | Authenticates as | vault-agent shape | What gets rendered |
+|---|---|---|---|
+| `mcp-agent` (CLI + ttyd) | Vault role `mcp-server`, SA `mcp-server` | **Init only** (`exit-after-auth=true`) | LLM API keys, `settings.yaml`, `capabilities.yaml` (static at pod boot) |
+| `mcp-data-server`, `mcp-compute-server` | Per-server Vault role bound to its own SA | **Init + sidecar** (`exit_after_auth=false`) | `/vault/secrets/gcp-token` from a dynamic GCP impersonation engine, refreshed on its own |
 
-Every `mcp-agents` pod runs a `vault-agent-init` container before the main container starts. It authenticates to Vault once, renders all static secrets into a shared memory volume, then exits.
+Both pod types use the same Kubernetes auth method (`auth/kubernetes`) and the same projected-SA-token / TokenReview chain — they differ only in role bindings, template content, and whether the agent process keeps running.
+
+### Agent pod: Phase 1 — vault-agent init container
+
+The `mcp-agent` pod runs a `vault-agent-init` container before the main container starts. It authenticates to Vault once, renders all static secrets into a shared memory volume, then exits.
 
 ```mermaid
 sequenceDiagram
@@ -113,12 +148,12 @@ sequenceDiagram
 | Vault path | Rendered file | Contents |
 |---|---|---|
 | `secret/data/mcp-agents/llm-keys` | `/vault/secrets/anthropic-key`<br/>`/vault/secrets/openai-key` | Raw API key values |
-| `secret/data/mcp-agents/config` | `/vault/secrets/settings.yaml` | Vault addr, GCP project, agent definitions, transport config |
+| `secret/data/mcp-agents/config` | `/vault/secrets/settings.yaml` | Vault addr, GCP project, agent definitions, MCP server upstream URLs |
 | `secret/data/mcp-agents/policies` | `/vault/secrets/capabilities.yaml` | Role → tool allowlists, max GCP token TTL |
 
 All files land in an `emptyDir` volume with `medium: Memory` — they never touch node disk.
 
-### Phase 2 — main container startup
+### Agent pod: Phase 2 — main container startup
 
 `docker/entrypoint.sh` waits for the `.ready` sentinel (max 120 s), then:
 
@@ -132,7 +167,7 @@ exec ttyd ... vault-mcp-agents ...
 
 The application reads `settings.yaml` and `capabilities.yaml` from the same volume at import time.
 
-### Phase 3 — runtime, per user session
+### Agent pod: Phase 3 — runtime, per user session
 
 When a user logs in through the web terminal:
 
@@ -142,26 +177,74 @@ sequenceDiagram
     participant U   as User (browser)
     participant App as vault-mcp-agents CLI
     participant V   as HCP Vault
-    participant MCP as MCP Server subprocess
+    participant Eag as Envoy<br/>(agent sidecar)
+    participant Esr as Envoy<br/>(server sidecar)
+    participant Srv as MCP server<br/>(data or compute)
     participant GCP as GCP API
 
-    U->>App: vault-mcp-agents --user alice --password …
+    U->>App: vault-mcp-agents (in web terminal)
     App->>V: auth/userpass login (alice)
     V-->>App: Session token (policy: operator-policy)
+    App->>App: Determine role, select agent (data / compute)
 
-    App->>V: gcp/impersonated-account/data-agent-gcp/token
-    V->>GCP: generateAccessToken (SA impersonation)
-    GCP-->>V: OAuth2 token (TTL 5 min)
-    V-->>App: OAuth2 token
+    App->>Eag: SSE connect → http://localhost:20000/sse<br/>(or 20001 for compute)
+    Eag->>Esr: Consul Connect mTLS<br/>ServiceIntention: mcp-agent → mcp-data-server (allow)
+    Esr->>Srv: plaintext on loopback (127.0.0.1:8080)
+    Srv-->>App: MCP session ready
 
-    App->>MCP: spawn subprocess<br/>env: GOOGLE_ACCESS_TOKEN=<token>
-    MCP->>GCP: storage.Client / bigquery.Client / compute_v1.InstancesClient<br/>(credentials from GOOGLE_ACCESS_TOKEN)
-    GCP-->>MCP: API response
-    MCP-->>App: Tool result
+    App->>Srv: call_tool(name, args)
+    Note over Srv: reads /vault/secrets/gcp-token<br/>(rotated by its own vault-agent sidecar)
+    Srv->>GCP: storage / bigquery / compute API call
+    GCP-->>Srv: API response
+    Srv-->>App: Tool result
     App-->>U: Agent response
 ```
 
-A fresh GCP token is fetched from Vault on every agent invocation. Tokens expire after 5 minutes server-side (Vault GCP engine TTL) and are also capped client-side in `capabilities.yaml`.
+The agent process never sees a GCP credential. Two independent trust hops protect every tool call: **Consul Connect mTLS + ServiceIntentions** authorise the agent→server RPC, and the server's own **vault-agent sidecar** mints a fresh 5-minute GCP token from Vault (renewed in place ahead of every lease expiry). `capabilities.yaml` is an LLM-level allow-list layered on top — see the next section for how the server pod manages its token.
+
+### MCP server pods (`mcp-data-server`, `mcp-compute-server`)
+
+The data and compute servers don't hold LLM keys, app config, or user sessions — their only Vault dependency is a continuously-fresh GCP OAuth2 token. They use a **vault-agent sidecar** (not just an init container) so Vault keeps the token file rotated for the life of the pod.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K8s as Kubernetes API
+    participant Init as vault-agent-init
+    participant Side as vault-agent (sidecar)
+    participant V    as HCP Vault
+    participant GCP  as GCP IAM
+    participant Vol  as /vault/secrets<br/>(memory emptyDir)
+    participant Srv  as MCP server<br/>(data / compute)
+
+    Init->>K8s: Projected SA token (audience=vault)
+    K8s->>V: TokenReview (vault-reviewer)
+    V-->>Init: Vault token (role: mcp-data-server / mcp-compute-server)
+    Init->>V: Read gcp/impersonated-account/<role>/token
+    V->>GCP: generateAccessToken (per-role SA impersonation)
+    GCP-->>V: OAuth2 token (TTL 5 min)
+    V-->>Init: Token + lease
+    Init->>Vol: Render /vault/secrets/gcp-token
+    Init->>Vol: Write .ready sentinel
+    Init->>Init: exit-after-auth (Init only)
+
+    Note over Side: starts in parallel with main container
+    Side->>V: auto_auth + lease renewal loop
+    V-->>Side: refreshed token before lease expiry
+    Side->>Vol: rewrite /vault/secrets/gcp-token
+
+    Srv->>Vol: read /vault/secrets/gcp-token at startup<br/>and on file change
+    Srv->>GCP: storage / bigquery / compute API calls<br/>(google.oauth2.credentials.Credentials)
+```
+
+| Field | mcp-data-server | mcp-compute-server |
+|---|---|---|
+| Vault role | `mcp-data-server` | `mcp-compute-server` |
+| Pod SA | `mcp-data-server` (mcp-agents ns) | `mcp-compute-server` (mcp-agents ns) |
+| Vault path templated | `gcp/impersonated-account/data-agent-gcp/token` | `gcp/impersonated-account/compute-agent-gcp/token` |
+| Impersonates | `data-agent-gcp` SA (`storage.objectAdmin`, `bigquery.dataEditor`+`jobUser`) | `compute-agent-gcp` SA (`compute.instanceAdmin.v1`) |
+
+The sidecar is configured with `exit_after_auth = false` and a single `template` block (see `templates/vault-agent-server.hcl.tpl`), so the file at `/vault/secrets/gcp-token` is overwritten in place ahead of every lease expiry. The MCP server reads the file at startup and re-reads it on the next call when authentication fails — no Vault SDK in the server process.
 
 ### Secret lifetime summary
 
@@ -172,7 +255,97 @@ A fresh GCP token is fetched from Vault on every agent invocation. Tokens expire
 | LLM API keys | Init container | Until pod restart | `/vault/secrets/` (memory emptyDir) |
 | `settings.yaml`, `capabilities.yaml` | Init container | Until pod restart | `/vault/secrets/` (memory emptyDir) |
 | Vault user session token | User login | Policy TTL | Python process memory |
-| GCP OAuth2 token | Per agent spawn | 5 min | `GOOGLE_ACCESS_TOKEN` env var in subprocess |
+| GCP OAuth2 token (MCP server pods) | vault-agent sidecar lease loop | 5 min, rewritten before expiry | `/vault/secrets/gcp-token` (memory emptyDir) |
+
+---
+
+## Vault ↔ Consul Integration
+
+Vault plays two roles for Consul: it is the **Connect CA provider** (every mTLS leaf cert in the mesh is issued via Vault PKI) and the **server-TLS source** (the gossip + RPC listener cert/key/CA). Both flows are driven by a vault-agent running on each Consul server VM — no operator-supplied secrets, no cert material in Packer images or Terraform state.
+
+### Authentication: GCP IAM, not Kubernetes
+
+Consul VMs are GCE instances, not pods, so the K8s auth method doesn't apply. They authenticate via Vault's **GCP IAM auth method**:
+
+| Field | Value |
+|---|---|
+| Auth method | `auth/gcp` (type `iam`) |
+| Identity | Instance metadata-service signed JWT, audience = Vault role |
+| Vault role | `consul-server` — bound to the Consul server SA email |
+| Token policy | `pki-consul-issuer` + `kv-consul-acl-token` (read CA, issue leaf certs, read bootstrap token) |
+
+The same SA is referenced by the scenario's `vault-pki` PKI roles and by the GCE instance — the `consul_server_sa_email` input wires both together so the prefix can never drift (this was historically a foot-gun; see CLAUDE.md / MEMORY.md).
+
+### What vault-agent renders on a Consul server
+
+`packer/configs/vault-agent-consul.hcl.tmpl` defines four `template` blocks; vault-agent renders them at boot and refreshes them as leases approach expiry.
+
+| Template destination | Vault source | Used by Consul for |
+|---|---|---|
+| `/etc/consul.d/tls/ca-chain.pem` | `pki-consul/cert/ca_chain` | TLS trust anchor (RPC + HTTPS API) |
+| `/etc/consul.d/tls/server.crt` + `server.key` | `pki-consul/issue/consul-server` (72h leaf) | TLS listener cert/key |
+| `/etc/consul.d/tls-certs.hcl` | n/a (paths only) | `tls { defaults { cert_file=… key_file=… ca_file=… } }` block |
+| `/etc/consul.d/connect-ca.hcl` | `pki-consul/cert/ca` (intermediate) | `connect { ca_provider = "vault" ca_config { … } }` — tells Consul to use Vault PKI as the Connect CA |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MD as GCP metadata
+    participant VA as vault-agent (Consul VM)
+    participant V  as HCP Vault
+    participant FS as /etc/consul.d
+    participant C  as Consul server
+
+    VA->>MD: signed instance JWT (aud=consul-server)
+    VA->>V: auth/gcp/login (role=consul-server, jwt=…)
+    V-->>VA: Vault token (1h, policy: pki-consul-issuer)
+
+    VA->>V: pki-consul/issue/consul-server (CN=server.dc1.consul, TTL=72h)
+    V-->>VA: cert + key + CA chain
+    VA->>FS: write server.crt / server.key / ca-chain.pem (vault:vault 0640)
+    VA->>FS: chgrp consul tls/* tls-certs.hcl  (post-render command)
+
+    VA->>V: pki-consul/cert/ca (intermediate)
+    V-->>VA: Connect CA config payload
+    VA->>FS: write connect-ca.hcl
+
+    Note over C: auto_reload_config = true
+    C->>FS: inotify on cert files
+    C->>C: hot-reload listener cert (no SIGHUP)
+```
+
+### Permission plumbing on the VM
+
+A few non-obvious file-permission rules exist because vault-agent and Consul run as different Unix users:
+
+- vault-agent writes everything as `vault:vault 0640`.
+- Packer adds `consul` to the `vault` group (`usermod -aG vault consul`) so it can read those files.
+- Each template's post-render `command` runs `chgrp consul …` on the rendered files (defence-in-depth — the template engine drops setgid otherwise).
+- `/etc/consul.d/` is `0770` and `/etc/consul.d/tls/` is `2770` (setgid) so vault-agent can write into them.
+
+Losing any one of these breaks Consul boot — see CLAUDE.md "Consul TLS" for the full failure-mode catalogue.
+
+### Cert renewal — without `systemctl reload`
+
+vault-agent v1.21.3 fixed a long-standing `pkiCert` non-renewal bug, so the templates renew themselves. As belt-and-braces:
+
+- A systemd timer runs `vault-agent-cert-refresh.sh` every 60 hours (cert TTL is 72h). The script issues a fresh cert via the Vault PKI REST API and replaces the files atomically.
+- Consul has `auto_reload_config = true` in `consul-server.hcl`, so it picks up the new cert files via inotify — **no SIGHUP, no `systemctl reload consul`**.
+- This matters because reloading Consul causes it to re-initialize the Vault Connect CA provider, which mints a fresh Connect intermediate CA and invalidates every mesh leaf cert in flight. Use `task consul:refresh-tls` (or run the refresh script directly) for cert renewal — never `systemctl reload`.
+
+### GKE side: how pods trust the Connect CA
+
+GKE pods that join the mesh (via the Consul Helm chart's connect-injector) need the same Connect intermediate CA chain that the VMs are using. That's brokered as a Kubernetes Secret rather than a Vault read:
+
+- `kubernetes_secret.consul_ca_cert` (key `tls.crt`) is seeded by Terraform during Phase 2 and lives in the `consul` namespace.
+- It has `lifecycle { ignore_changes = [data] }` — Terraform never overwrites the live data after creation.
+- `task consul:refresh-tls` re-reads `ca-chain.pem` from the running Consul VM and `kubectl apply`s it back into the secret. Run it before every Helm deploy (and any time the Connect CA actually rotates) to keep the cluster's trust anchor in sync.
+
+### Why this design
+
+- **Single CA root for VM TLS *and* Connect mTLS** — operators audit one PKI, not two. PKI TTLs (root 10y, intermediate 5y, leaf 72h) are uniform across the mesh.
+- **No long-lived TLS material on the VM** — Packer images contain no certs; a hijacked image can't impersonate a server without first authenticating to Vault as the consul-server GCP SA.
+- **No app-level secret distribution code** — neither Consul nor the MCP servers contain Vault-client SDK calls for TLS or GCP credentials. vault-agent owns the lease loop; the apps just read files.
 
 ---
 
